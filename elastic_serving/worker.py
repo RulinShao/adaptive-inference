@@ -224,6 +224,7 @@ class WorkerDaemon:
                 "--gpu-memory-utilization", str(self.gpu_memory_utilization),
                 "--trust-remote-code",
                 "--disable-log-requests",
+                "--enable-prefix-caching",
             ]
             if self.max_model_len is not None:
                 cmd.extend(["--max-model-len", str(self.max_model_len)])

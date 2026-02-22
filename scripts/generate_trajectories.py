@@ -24,7 +24,7 @@ import re
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import dotenv
 import httpx
@@ -33,187 +33,12 @@ dotenv.load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
-JINA_API_KEY = os.getenv("JINA_API_KEY", "")
-
-# Tool definitions for tokenizer.apply_chat_template
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search",
-            "description": (
-                "Search the web for information. Returns top results "
-                "with titles, URLs, and snippets."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_url",
-            "description": (
-                "Open a URL and read its content. Returns the page text."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "The URL to open",
-                    }
-                },
-                "required": ["url"],
-            },
-        },
-    },
-]
-
-SYSTEM_PROMPT = """You are a helpful research assistant. You can search the web and read web pages to find accurate, detailed answers to questions.
-
-When answering a question:
-1. Think step-by-step about what information you need.
-2. Use the search tool to find relevant sources.
-3. Use open_url to read promising results in detail.
-4. Synthesize information from multiple sources.
-5. Provide a clear, well-sourced answer.
-
-Always verify claims across multiple sources when possible."""
-
-
-# =============================================================================
-# Tool Implementations
-# =============================================================================
-
-async def tool_search(query: str, http_client: httpx.AsyncClient) -> str:
-    if not SERPER_API_KEY:
-        return "Error: SERPER_API_KEY not set"
-    try:
-        resp = await http_client.post(
-            "https://google.serper.dev/search",
-            json={"q": query, "num": 10},
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("organic", [])
-        if not results:
-            return f"No search results found for: {query}"
-        lines = []
-        for i, r in enumerate(results, 1):
-            lines.append(f"[{i}] {r.get('title', '')}\n    URL: {r.get('link', '')}\n    {r.get('snippet', '')}")
-        return "\n\n".join(lines)
-    except Exception as e:
-        return f"Search error: {e}"
-
-
-async def tool_open_url(url: str, http_client: httpx.AsyncClient) -> str:
-    if not JINA_API_KEY:
-        try:
-            resp = await http_client.get(url, follow_redirects=True, timeout=30)
-            return resp.text[:20000]
-        except Exception as e:
-            return f"Error fetching URL: {e}"
-    try:
-        resp = await http_client.get(
-            f"https://r.jina.ai/{url}",
-            headers={
-                "Authorization": f"Bearer {JINA_API_KEY}",
-                "Accept": "text/plain",
-                "X-Return-Format": "text",
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        content = resp.text
-        if len(content) > 30000:
-            content = content[:30000] + "\n\n[... content truncated ...]"
-        return content
-    except Exception as e:
-        return f"Error reading URL: {e}"
-
-
-async def execute_tool(name: str, args: dict, http_client: httpx.AsyncClient) -> str:
-    if name == "search":
-        query = args.get("query", "")
-        if not query:
-            return "Error: search requires a 'query' parameter"
-        return await tool_search(query, http_client)
-    elif name == "open_url":
-        url = args.get("url", "")
-        # Model sometimes sends a query string instead of a URL — redirect to search
-        if not url or not url.startswith(("http://", "https://")):
-            query = url or args.get("query", "")
-            if query:
-                return f"Error: open_url requires a valid URL starting with http:// or https://. Got: '{query[:100]}'. Use the search tool instead."
-            return "Error: open_url requires a 'url' parameter with a valid URL"
-        return await tool_open_url(url, http_client)
-    return f"Unknown tool: {name}"
-
-
-# =============================================================================
-# Harmony format parsing
-# =============================================================================
-
-def parse_tool_call_from_raw(text: str) -> Optional[Tuple[str, dict]]:
-    """Parse a tool call from the raw generated text.
-
-    The model generates:
-      ... to=functions.TOOLNAME<|channel|>commentary json<|message|>"..."<|call|>
-    or:
-      ... to=functions.TOOLNAME<|channel|>commentary code<|message|>{...}<|call|>
-
-    We also handle the case where the model generates inline tool calls
-    in the format: `assistantcommentary to=functions.search json{...}`
-    """
-    # Pattern 1: Harmony special tokens
-    m = re.search(r'to=functions\.(\w+)', text)
-    if m:
-        tool_name = m.group(1)
-        # Try to find JSON args after <|message|> or after json/code marker
-        msg_match = re.search(r'<\|message\|>(.*?)(?:<\|call\|>|<\|end\|>|$)', text, re.DOTALL)
-        if msg_match:
-            args_str = msg_match.group(1).strip()
-        else:
-            # Fallback: find JSON after the tool name
-            after = text[m.end():]
-            # Look for json{...} or code{...} pattern
-            json_match = re.search(r'(?:json|code)\s*(\{.*?\})\s*$', after, re.DOTALL)
-            if json_match:
-                args_str = json_match.group(1)
-            else:
-                args_str = after.strip()
-
-        # Clean up: remove quotes around JSON string
-        if args_str.startswith('"') and args_str.endswith('"'):
-            try:
-                args_str = json.loads(args_str)  # unescape
-            except Exception:
-                args_str = args_str[1:-1]
-
-        try:
-            args = json.loads(args_str)
-            return tool_name, args
-        except json.JSONDecodeError:
-            # Try to extract just the query
-            query_match = re.search(r'"query"\s*:\s*"([^"]*)"', args_str)
-            if query_match:
-                return tool_name, {"query": query_match.group(1)}
-            url_match = re.search(r'"url"\s*:\s*"([^"]*)"', args_str)
-            if url_match:
-                return tool_name, {"url": url_match.group(1)}
-
-    return None
+from elastic_serving.tools import (
+    SYSTEM_PROMPT,
+    TOOLS,
+    execute_tool,
+    parse_tool_call_from_raw,
+)
 
 
 # =============================================================================
