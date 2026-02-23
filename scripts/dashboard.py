@@ -128,11 +128,11 @@ def render(args):
                 pass
 
     n = len(trajs)
+    qids = set(t["qid"] for t in trajs)
+    n_q = len(qids)
     # Auto-detect target from trajectory indices
     max_traj_idx = max((t.get("traj_idx", 0) for t in trajs), default=0) + 1
     target = n_q * max_traj_idx if n_q > 0 else n
-    qids = set(t["qid"] for t in trajs)
-    n_q = len(qids)
 
     # Tool stats
     tool_counts = Counter()
