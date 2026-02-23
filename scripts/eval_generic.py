@@ -261,7 +261,7 @@ async def run_eval(args):
 
     judge_http = httpx.AsyncClient(timeout=60)
     sem = asyncio.Semaphore(args.concurrency)
-    api_sem = asyncio.Semaphore(min(args.concurrency * 2, 50))
+    api_sem = asyncio.Semaphore(min(args.concurrency * 3, 200))
     total_done = 0
     all_results = []
     write_buffer = []
