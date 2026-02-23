@@ -715,5 +715,11 @@ async def execute_custom_tool(
             http_client=http_client,
             limit=int(args.get("limit", 5)),
         )
-    return f"Unknown custom tool: {name}"
+    # Model sometimes confuses namespaces (e.g. functions.browser instead
+    # of browser.search).  Return a helpful nudge rather than a hard error.
+    return (
+        f"Unknown tool: functions.{name}. "
+        f"Available: paper_search, pubmed_search. "
+        f"For web search use browser.search; to open a page use browser.open."
+    )
 
