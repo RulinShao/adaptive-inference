@@ -1,6 +1,6 @@
-# Elastic Serving
+# Elastic Inference
 
-Run vLLM/SGLang inference servers elastically on low-priority SLURM resources. The scheduler greedily acquires nodes up to a user-defined cap and automatically replaces preempted ones.
+Run vLLM/SGLang inference servers elastically on low-priority SLURM resources, with built-in deep research agent tools (web search, paper search, PubMed).
 
 ## Architecture
 
@@ -31,24 +31,21 @@ Run vLLM/SGLang inference servers elastically on low-priority SLURM resources. T
      TP=4, DP=2 per node (configurable)
 ```
 
-**Key idea:** a background thread continuously runs `sbatch` to fill up to `max_nodes`. Each SLURM job starts a worker that launches one or more vLLM/SGLang instances (DP shards) with disjoint GPU slices, registers with the scheduler, and sends heartbeats. If a node is preempted (heartbeat timeout), the scheduler cleans it up and the acquirer thread submits a replacement.
-
-Clients see a single OpenAI-compatible endpoint at the scheduler URL. Requests are round-robin'd across all ready workers.
+A background thread continuously `sbatch`es up to `max_nodes`. Each SLURM job launches vLLM/SGLang instances with disjoint GPU slices, registers with the scheduler, and sends heartbeats. Preempted nodes are detected and replaced automatically. Clients see a single OpenAI-compatible endpoint.
 
 ## Quick Start
 
 ```bash
-# Start scheduler on login node — auto-acquires up to 16 H200 nodes
+# Start scheduler — auto-acquires up to 2 H200 nodes on low priority
 python -m elastic_serving.scheduler \
-    --model meta-llama/Llama-3-70B-Instruct \
-    --tensor-parallel-size 4 \
-    --max-nodes 16
+    --model /path/to/model \
+    --tensor-parallel-size 8 --max-nodes 2
 
-# Use from Python (standard OpenAI client)
+# Use from Python
 from openai import OpenAI
 client = OpenAI(base_url="http://SCHEDULER_HOST:8780/v1", api_key="EMPTY")
 resp = client.chat.completions.create(
-    model="meta-llama/Llama-3-70B-Instruct",
+    model="/path/to/model",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 
@@ -56,69 +53,103 @@ resp = client.chat.completions.create(
 python -m elastic_serving.client status
 ```
 
+## Deep Research Agent
+
+Built-in agentic tool-use framework using the model's native Harmony token format (`builtin_tools=["browser"]`). The agent can search the web, read pages, search academic papers, and query biomedical literature — all via tool calls within a single generation loop.
+
+### Tools
+
+| Tool | Backend | Namespace | Use for |
+|------|---------|-----------|---------|
+| `browser.search` | Serper | built-in | Web search |
+| `browser.open` | Jina Reader | built-in | Read web pages |
+| `browser.find` | local | built-in | Find text in opened page |
+| `paper_search` | Semantic Scholar | custom | Academic papers (metadata or body snippets) |
+| `pubmed_search` | PubMed/NCBI | custom | Biomedical literature |
+
+See [`elastic_serving/dr_utils/README.md`](elastic_serving/dr_utils/README.md) for detailed tool reference.
+
+### Interactive Chat
+
+```bash
+# Chat with tool use
+python scripts/chat.py --scheduler-url http://localhost:8780
+
+# With verbose mode (shows token counts, timing)
+python scripts/chat.py --verbose --max-tool-calls 20
+```
+
+### Evaluation (WebShaper)
+
+```bash
+# Set API keys
+echo "SERPER_API_KEY=..." >> .env
+echo "JINA_API_KEY=..." >> .env
+echo "S2_API_KEY=..." >> .env
+
+# Test with 1 question
+python scripts/eval_webshaper.py --num-samples 1 --num-trajectories 1
+
+# Full eval: 500 questions × 4 trajectories, pass@4 with LLM judge
+python scripts/eval_webshaper.py \
+    --num-samples 500 --num-trajectories 4 \
+    --max-tool-calls 50 --concurrency 8
+```
+
+### Trajectory Generation
+
+```bash
+python scripts/generate_trajectories.py \
+    --dataset sample --num-samples 5 --max-tool-calls 15
+```
+
 ## Parallelism: DP + TP
 
-Each node gets 8 GPUs exclusively and runs `gpus_per_node / tensor_parallel_size` independent server instances:
+Each node gets 8 GPUs exclusively and runs `gpus_per_node / tp_size` independent server instances:
 
-| TP | DP/node | Workers/node | 16 nodes total |
-|----|---------|-------------|----------------|
-| 1  | 8       | 8 instances | 128 workers    |
-| 2  | 4       | 4 instances | 64 workers     |
-| 4  | 2       | 2 instances | 32 workers     |
-| 8  | 1       | 1 instance  | 16 workers     |
+| TP | DP/node | 16 nodes total |
+|----|---------|----------------|
+| 1  | 8       | 128 workers    |
+| 4  | 2       | 32 workers     |
+| 8  | 1       | 16 workers     |
+
+vLLM prefix caching is enabled by default for efficient multi-round agentic conversations.
 
 ## Configuration
-
-Defaults are set for FAIR cluster H200 nodes (`h200_lowest` QoS, `dream` account). Override via CLI:
 
 ```bash
 python -m elastic_serving.scheduler \
     --model /path/to/model \
-    --engine vllm \          # or sglang
-    --qos h200_lowest \
-    --partition h200 \
-    --account dream \
-    --max-nodes 16 \
-    --tensor-parallel-size 4 \
-    --gpu-memory-utilization 0.90 \
-    --conda-env rl_verl \
-    --port 8780
+    --engine vllm \
+    --qos h200_lowest --partition h200 --account dream \
+    --max-nodes 16 --tensor-parallel-size 4 \
+    --conda-env rl_verl --port 8780
 ```
 
 Or load from JSON: `--config config.json`.
-
-## Trajectory Generation
-
-Included script for generating deep-research SFT trajectories using gpt-oss-120b with web search (Serper) and URL reading (Jina):
-
-```bash
-# Set API keys in .env
-echo "SERPER_API_KEY=..." >> .env
-echo "JINA_API_KEY=..." >> .env
-
-python scripts/generate_trajectories.py \
-    --scheduler-url http://localhost:8780 \
-    --dataset sample \
-    --num-samples 10 \
-    --concurrency 4
-```
-
-The script uses `tokenizer.apply_chat_template` with native Harmony tokens to format tool definitions and tool calls, and generates via the `/v1/completions` endpoint. Tool calls are intercepted at `<|call|>` stop tokens, executed, and fed back through the chat template.
 
 ## Project Structure
 
 ```
 elastic_serving/
-├── scheduler.py    # FastAPI scheduler + SLURM node acquirer + OpenAI proxy
-├── worker.py       # Per-node daemon: starts DP vLLM/SGLang instances
-├── client.py       # CLI + Python client helpers
-└── config.py       # Data models and SchedulerConfig
+├── scheduler.py          # FastAPI scheduler + SLURM acquirer + OpenAI proxy
+├── worker.py             # Per-node daemon: starts DP vLLM/SGLang instances
+├── client.py             # CLI + Python client helpers
+├── config.py             # Data models and SchedulerConfig
+├── tools.py              # Harmony format parsing, prompt building, re-exports
+└── dr_utils/             # Deep research tools and prompts
+    ├── tools.py           # BrowserSession, paper_search, pubmed_search
+    ├── prompts.py         # System prompt, model identity
+    └── README.md          # Tool reference
 scripts/
-├── generate_trajectories.py   # SFT trajectory generation with tool use
-├── test_load.py               # Load testing
-├── launch_scheduler.sh        # Shell launcher
-├── launch_scheduler.slurm     # SLURM launcher for scheduler
-└── launch_worker.slurm        # Manual worker launcher
+├── chat.py               # Interactive CLI chat with tool use
+├── eval_webshaper.py     # WebShaper evaluation (pass@k with LLM judge)
+├── generate_trajectories.py  # Trajectory generation
+├── test_load.py          # Load testing
+└── launch_scheduler.sh   # Shell launcher
+tests/
+├── test_tools.py         # Tool integration tests
+└── test_prefix_caching.py  # Prefix caching benchmark
 ```
 
 ## Install
@@ -127,4 +158,3 @@ scripts/
 pip install -e ".[client]"   # for openai client helper
 # vllm/sglang should already be in your conda env
 ```
-
