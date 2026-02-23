@@ -128,6 +128,42 @@ python -m elastic_serving.scheduler \
 
 Or load from JSON: `--config config.json`.
 
+## Dashboard
+
+Live monitoring of cluster status and eval job progress:
+
+```bash
+python scripts/dashboard.py                  # auto-refresh with colors
+python scripts/dashboard.py --once           # print once
+python scripts/dashboard.py --interval 5     # faster refresh
+```
+
+```
+  ╔══════════════════════════════════════════════════════╗
+  ║         Elastic Inference — Live Dashboard          ║
+  ╚══════════════════════════════════════════════════════╝
+
+  Cluster  gpt-oss-120b
+  Workers: 2 ready
+
+  Host                    Running  Waiting   KV Cache
+  h200-148-164-254            7.0      0.0       0.6%
+  h200-172-227                6.0      0.0       0.5%
+
+  Eval Progress
+  █████████░░░░░░░░░░░░░░░░ 798/2000 trajectories (40%)
+  ████████░░░░░░░░░░░░░░░░░ 163/500 questions
+
+  Tool Calls  12622 total, 15.8/traj
+  █████████████░░░░░░░░░░░░ browser.search       6607 ( 52%)
+  ████████░░░░░░░░░░░░░░░░░ browser.open         4410 ( 35%)
+  ██░░░░░░░░░░░░░░░░░░░░░░░ browser.find         1385 ( 11%)
+
+  Accuracy  (substring match estimate)
+  Traj accuracy:  49.5%  (395/798)
+  pass@k (est):   68.1%  (111/163)
+```
+
 ## Project Structure
 
 ```
