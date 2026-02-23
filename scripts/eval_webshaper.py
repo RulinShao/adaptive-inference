@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -184,15 +185,24 @@ async def generate_trajectory(
         else:
             # Final answer
             reasoning, answer = extract_final_answer(raw_text)
+
+            # Extract \boxed{...} if present
+            boxed_match = re.search(
+                r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}', answer
+            )
+            boxed_answer = boxed_match.group(1).strip() if boxed_match else ""
+
             elapsed = time.time() - t0
+            short = boxed_answer or answer[:100]
             print(f"  [{tag}] Done: {tool_call_count} tools, "
-                  f"{elapsed:.1f}s, answer={answer[:100]}")
+                  f"{elapsed:.1f}s, answer={short}")
 
             return {
                 "qid": qid,
                 "traj_idx": traj_idx,
                 "question": question,
                 "answer": answer,
+                "boxed_answer": boxed_answer,
                 "reasoning": reasoning,
                 "num_tool_calls": tool_call_count,
                 "tool_calls": tool_calls_log,
@@ -439,10 +449,12 @@ async def run_evaluation(
         async with judge_sem:
             if r.get("status") != "success" or not r.get("answer", "").strip():
                 return {**r, "judge": {"correct": False, "explanation": "no answer"}}
+            # Prefer boxed_answer for judging (more precise)
+            prediction = r.get("boxed_answer") or r.get("answer", "")
             verdict = await judge_answer(
                 question=r["question"],
                 reference=r.get("reference_answer", ""),
-                prediction=r["answer"],
+                prediction=prediction,
                 judge_http=judge_http,
                 judge_model=judge_model,
             )
@@ -482,17 +494,20 @@ async def run_evaluation(
         if any_correct:
             pass_count += 1
 
+        accuracy = num_correct / max(len(trajs), 1)
         per_question.append({
             "qid": qid,
             "question": trajs[0].get("question", "")[:200],
             "reference": trajs[0].get("reference_answer", ""),
             "num_trajectories": len(trajs),
             "num_correct": num_correct,
+            "accuracy": accuracy,
             "pass": any_correct,
             "answers": [
                 {
                     "traj_idx": t.get("traj_idx"),
                     "answer": t.get("answer", "")[:500],
+                    "boxed_answer": t.get("boxed_answer", ""),
                     "correct": t.get("judge", {}).get("correct", False),
                     "explanation": t.get("judge", {}).get("explanation", ""),
                     "num_tools": t.get("num_tool_calls", 0),
@@ -503,6 +518,11 @@ async def run_evaluation(
         })
 
     pass_at_k = pass_count / max(total_questions, 1)
+
+    # avg@k: average per-question accuracy (num_correct / num_trajectories)
+    avg_at_k = (
+        sum(q["accuracy"] for q in per_question) / max(len(per_question), 1)
+    )
 
     # Individual trajectory accuracy
     total_trajs = len(judged_results)
@@ -524,6 +544,7 @@ async def run_evaluation(
         "temperature": temperature,
         "judge_model": judge_model,
         f"pass@{num_trajectories}": pass_at_k,
+        f"avg@{num_trajectories}": avg_at_k,
         "trajectory_accuracy": traj_acc,
         "correct_trajectories": correct_trajs,
         "avg_tool_calls": round(avg_tools, 1),
@@ -546,6 +567,7 @@ async def run_evaluation(
     print(f"  Judge:            {judge_model}")
     print(f"  ────────────────────────────────────────")
     print(f"  pass@{num_trajectories}:          {pass_at_k:.1%} ({pass_count}/{total_questions})")
+    print(f"  avg@{num_trajectories}:           {avg_at_k:.1%}")
     print(f"  Traj accuracy:    {traj_acc:.1%} ({correct_trajs}/{total_trajs})")
     print(f"  Avg tool calls:   {avg_tools:.1f}")
     print(f"  Avg latency:      {avg_time:.1f}s")
