@@ -130,9 +130,8 @@ def render(args):
     n = len(trajs)
     qids = set(t["qid"] for t in trajs)
     n_q = len(qids)
-    # Auto-detect target from trajectory indices
     max_traj_idx = max((t.get("traj_idx", 0) for t in trajs), default=0) + 1
-    target = n_q * max_traj_idx if n_q > 0 else n
+    target = args.target if args.target > 0 else n  # use --target or fallback to current count
 
     # Tool stats
     tool_counts = Counter()
@@ -174,7 +173,7 @@ def render(args):
     # Progress section
     print(f"  {BOLD}{WHITE}Eval Progress{RESET}")
     print(f"  {bar(n, target)} {BOLD}{n}{RESET}/{target} trajectories ({n/max(target,1)*100:.0f}%)")
-    target_q = target // max(max_traj_idx, 1)
+    target_q = target // max(max_traj_idx, 1) if target > n else n_q
     print(f"  {bar(n_q, target_q, fill_color=BLUE)} {BOLD}{n_q}{RESET}/{target_q} questions")
     print()
     print(f"  {DIM}Avg time/traj:{RESET}  {BOLD}{avg_time:.0f}s{RESET}    "
@@ -223,6 +222,8 @@ def main():
     parser = argparse.ArgumentParser(description="Live dashboard for elastic inference")
     parser.add_argument("--scheduler-url", default=os.environ.get("ELASTIC_SERVING_URL", "http://localhost:8780"))
     parser.add_argument("--output-dir", default="results/webshaper_full")
+    parser.add_argument("--target", type=int, default=0,
+                        help="Total expected trajectories (auto-detected if 0)")
     parser.add_argument("--once", action="store_true", help="Print once and exit")
     parser.add_argument("--interval", type=int, default=10, help="Refresh interval in seconds")
     parser.add_argument("--_render", action="store_true", help=argparse.SUPPRESS)
@@ -239,6 +240,7 @@ def main():
             "--_render",
             "--scheduler-url", args.scheduler_url,
             "--output-dir", args.output_dir,
+            "--target", str(args.target),
         ]
         try:
             os.execvp("watch", cmd)
