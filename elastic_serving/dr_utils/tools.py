@@ -531,10 +531,167 @@ async def paper_search(
 
 
 # =============================================================================
+# ---- pubmed_search (functions.* namespace, NCBI PubMed) ----
+# =============================================================================
+
+PUBMED_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+PUBMED_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "pubmed_search",
+        "description": (
+            "Search biomedical and life science literature via PubMed "
+            "(NCBI). Returns paper titles, abstracts, authors, journal, "
+            "and PubMed URLs. Use this for medical, biological, clinical, "
+            "and health science questions."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Search query. Supports PubMed syntax: "
+                        "MeSH terms, boolean operators (AND/OR/NOT), "
+                        "field tags like [Author], [Journal], [Title]."
+                    ),
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Max results to return (default: 5).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def _extract_xml_text(element) -> str:
+    """Extract all text from an XML element including nested tags."""
+    if element is None:
+        return ""
+    return " ".join(t.strip() for t in element.itertext() if t.strip())
+
+
+async def pubmed_search(
+    query: str,
+    http_client: httpx.AsyncClient,
+    limit: int = 5,
+) -> str:
+    """Search PubMed via NCBI E-utilities API."""
+    from xml.etree import ElementTree
+
+    # Step 1: search for PubMed IDs
+    try:
+        resp = await http_client.get(
+            f"{PUBMED_BASE_URL}/esearch.fcgi",
+            params={
+                "db": "pubmed",
+                "term": query,
+                "retmax": min(limit, 20),
+                "sort": "relevance",
+                "retmode": "xml",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        root = ElementTree.fromstring(resp.content)
+        id_list = [el.text for el in root.findall("./IdList/Id") if el.text]
+    except Exception as e:
+        return f"PubMed search error: {e}"
+
+    if not id_list:
+        return f"No PubMed results for: {query}"
+
+    # Step 2: fetch paper details
+    try:
+        resp = await http_client.get(
+            f"{PUBMED_BASE_URL}/efetch.fcgi",
+            params={
+                "db": "pubmed",
+                "id": ",".join(id_list),
+                "retmode": "xml",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        papers_xml = ElementTree.fromstring(resp.content)
+    except Exception as e:
+        return f"PubMed fetch error: {e}"
+
+    lines = [f'PubMed search: "{query}"', ""]
+
+    for i, article_el in enumerate(papers_xml.findall("./PubmedArticle"), 1):
+        article = article_el.find(".//Article")
+        pmid_el = article_el.find(".//PMID")
+        pmid = pmid_el.text if pmid_el is not None else ""
+
+        title = _extract_xml_text(article.find(".//ArticleTitle")) if article is not None else ""
+
+        # Abstract (may have labeled sections like BACKGROUND, METHODS, etc.)
+        abstract_parts = []
+        if article is not None and article.find(".//Abstract") is not None:
+            for ab_text in article.findall(".//Abstract/AbstractText"):
+                label = ab_text.attrib.get("Label", "")
+                text = _extract_xml_text(ab_text)
+                if label:
+                    abstract_parts.append(f"{label}: {text}")
+                else:
+                    abstract_parts.append(text)
+        abstract = " ".join(abstract_parts)
+        if len(abstract) > 600:
+            abstract = abstract[:600] + "..."
+
+        # Authors
+        authors = []
+        if article is not None:
+            for auth in article.findall(".//Author"):
+                last = auth.find("./LastName")
+                fore = auth.find("./ForeName")
+                if last is not None and fore is not None:
+                    authors.append(f"{fore.text} {last.text}")
+        author_str = ", ".join(authors[:4])
+        if len(authors) > 4:
+            author_str += " et al."
+
+        # Journal and year
+        journal = ""
+        if article is not None:
+            j_el = article.find(".//Journal/Title")
+            if j_el is not None:
+                journal = j_el.text or ""
+        year = ""
+        if article is not None:
+            y_el = article.find(".//Journal/JournalIssue/PubDate/Year")
+            if y_el is not None:
+                year = y_el.text or ""
+
+        lines.append(f"[{i}] {title}")
+        if author_str:
+            lines.append(f"    Authors: {author_str}")
+        meta = []
+        if year:
+            meta.append(f"Year: {year}")
+        if journal:
+            meta.append(journal)
+        if meta:
+            lines.append(f"    {' | '.join(meta)}")
+        if pmid:
+            lines.append(f"    URL: https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
+        if abstract:
+            lines.append(f"    Abstract: {abstract}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
 # ---- Custom tool registry ----
 # =============================================================================
 
-CUSTOM_TOOLS = [PAPER_SEARCH_TOOL]
+CUSTOM_TOOLS = [PAPER_SEARCH_TOOL, PUBMED_SEARCH_TOOL]
 """All custom tool specs — passed to ``apply_chat_template(tools=...)``."""
 
 
@@ -551,6 +708,12 @@ async def execute_custom_tool(
             year=args.get("year"),
             fields_of_study=args.get("fields_of_study"),
             venue=args.get("venue"),
+        )
+    elif name == "pubmed_search":
+        return await pubmed_search(
+            query=args.get("query", ""),
+            http_client=http_client,
+            limit=int(args.get("limit", 5)),
         )
     return f"Unknown custom tool: {name}"
 

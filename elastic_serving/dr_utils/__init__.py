@@ -9,9 +9,11 @@ Submodules:
 from elastic_serving.dr_utils.tools import (
     CUSTOM_TOOLS,
     PAPER_SEARCH_TOOL,
+    PUBMED_SEARCH_TOOL,
     BrowserSession,
     execute_custom_tool,
     paper_search,
+    pubmed_search,
 )
 from elastic_serving.dr_utils.prompts import (
     MODEL_IDENTITY,
