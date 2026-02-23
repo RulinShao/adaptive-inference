@@ -645,8 +645,6 @@ async def run_evaluation(
     print(f"  Results:          {results_file}")
     print(f"{'='*60}")
 
-    await http_client.aclose()
-    await openai_http.aclose()
     await judge_http.aclose()
 
 
