@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-SFT Trajectory Generation with Deep Research (gpt-oss-120b)
-=============================================================
+SFT Trajectory Generation with Deep Research
+==============================================
 
-Uses the gpt-oss-120b model's native Harmony channel format for tool calling.
-Generates via /v1/completions with tokenizer.apply_chat_template.
+Generates research trajectories using Harmony-native browser tools
+(browser.search, browser.open, browser.find) and paper_search.
 
-Tools: Serper (search) and Jina (web reader / URL fetcher).
-Output: JSONL with full multi-turn trajectories.
+Output: JSONL with full trajectories including tool calls and answers.
 
 Usage:
-    python scripts/generate_trajectories.py \
-        --scheduler-url http://localhost:8780 \
-        --dataset sample --num-samples 3 \
+    python scripts/generate_trajectories.py \\
+        --scheduler-url http://localhost:8780 \\
+        --dataset sample --num-samples 3 \\
         --output-dir results/trajectories
 """
 
@@ -20,11 +19,10 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 import time
 import traceback
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import dotenv
 import httpx
@@ -34,16 +32,22 @@ dotenv.load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from elastic_serving.tools import (
-    LEGACY_SYSTEM_PROMPT as SYSTEM_PROMPT,
-    TOOLS,
-    execute_tool,
-    parse_tool_call_from_raw,
+    STOP_TOKENS,
+    STOP_TOKENS_NO_CALL,
+    SYSTEM_PROMPT,
+    BrowserSession,
+    append_tool_round,
+    build_initial_prompt,
+    execute_custom_tool,
+    extract_final_answer,
+    parse_tool_call,
 )
 
 
 # =============================================================================
 # Trajectory Generation
 # =============================================================================
+
 
 async def generate_one_trajectory(
     question: str,
@@ -53,38 +57,24 @@ async def generate_one_trajectory(
     tokenizer,
     http_client: httpx.AsyncClient,
     openai_http: httpx.AsyncClient,
-    max_rounds: int = 15,
+    max_tool_calls: int = 15,
     max_gen_tokens: int = 8192,
+    temperature: float = 0.7,
 ) -> Dict[str, Any]:
     """Generate a single research trajectory."""
+    browser = BrowserSession(http_client)
+    tool_call_count = 0
+    tool_calls_log: List[Dict[str, Any]] = []
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+    prompt = build_initial_prompt(tokenizer, user_message=question)
 
-    round_num = 0
-    total_tool_calls = 0
+    t0 = time.time()
+    print(f"  [qid={qid}] Starting")
 
-    # <|call|> marks end of tool call; <|end|> marks end of assistant turn
-    stop_tokens = ["<|call|>", "<|end|>", "<|endoftext|>"]
+    while True:
+        at_limit = tool_call_count >= max_tool_calls
+        stops = STOP_TOKENS_NO_CALL if at_limit else STOP_TOKENS
 
-    while round_num < max_rounds:
-        round_num += 1
-
-        # On the last round, don't stop at <|call|> — force a final answer
-        is_last_round = (round_num == max_rounds)
-        current_stops = ["<|end|>", "<|endoftext|>"] if is_last_round else stop_tokens
-
-        # Build prompt
-        prompt = tokenizer.apply_chat_template(
-            messages, tools=TOOLS, tokenize=False, add_generation_prompt=True,
-        )
-        prompt_tokens = len(tokenizer.encode(prompt))
-        suffix = " (final)" if is_last_round else ""
-        print(f"  [qid={qid}] Round {round_num}/{max_rounds} ({prompt_tokens} tokens){suffix}")
-
-        # Generate via /v1/completions
         try:
             resp = await openai_http.post(
                 f"{base_url}/v1/completions",
@@ -92,99 +82,85 @@ async def generate_one_trajectory(
                     "model": model,
                     "prompt": prompt,
                     "max_tokens": max_gen_tokens,
-                    "temperature": 0.7,
-                    "stop": current_stops,
+                    "temperature": temperature,
+                    "stop": stops,
                 },
                 headers={"Authorization": "Bearer EMPTY"},
-                timeout=300,
+                timeout=600,
             )
+            if resp.status_code == 503:
+                await asyncio.sleep(10)
+                continue
             resp.raise_for_status()
-            data = resp.json()
-            raw_text = data["choices"][0]["text"]
-            finish_reason = data["choices"][0].get("finish_reason", "")
+            raw_text = resp.json()["choices"][0]["text"]
         except Exception as e:
             print(f"  [qid={qid}] Generation error: {e}")
-            messages.append({"role": "assistant", "content": f"[Error: {e}]"})
             break
 
-        # Check if this is a tool call (stopped at <|call|>) or final answer
-        tool_call = parse_tool_call_from_raw(raw_text) if not is_last_round else None
+        tool_call = parse_tool_call(raw_text) if not at_limit else None
 
         if tool_call:
-            tool_name, tool_args = tool_call
-            print(f"  [qid={qid}]   Tool: {tool_name}({json.dumps(tool_args)[:120]})")
+            ns, tool_name, tool_args = tool_call
+            tool_call_count += 1
 
-            # Record the tool call in messages
-            call_id = f"call_{round_num}"
-            messages.append({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(tool_args),
-                    },
-                }],
+            short = json.dumps(tool_args, ensure_ascii=False)[:100]
+            print(f"  [qid={qid}]   Tool {tool_call_count}: {ns}.{tool_name}({short})")
+
+            if ns == "browser":
+                result = await browser.execute(tool_name, tool_args)
+            else:
+                result = await execute_custom_tool(tool_name, tool_args, http_client)
+
+            tool_calls_log.append({
+                "round": tool_call_count,
+                "tool": f"{ns}.{tool_name}",
+                "args": tool_args,
+                "result_len": len(result),
             })
 
-            # Execute tool
-            result = await execute_tool(tool_name, tool_args, http_client)
-            total_tool_calls += 1
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": result,
-            })
+            prompt = append_tool_round(prompt, raw_text, tool_name, result, namespace=ns)
             continue
         else:
-            # Final answer — extract content from harmony channel format
-            # Raw text looks like: "analysis...assistantfinal THE ANSWER"
-            # or: "analysis...assistantcommentary...assistantfinal THE ANSWER"
-            content = raw_text
-            reasoning = ""
+            reasoning, answer = extract_final_answer(raw_text)
+            elapsed = time.time() - t0
+            print(f"  [qid={qid}] Done: {tool_call_count} tools, {elapsed:.1f}s, "
+                  f"answer={answer[:80]}")
 
-            # Extract the final channel content (everything after "assistantfinal" or just "final")
-            final_match = re.search(r'(?:assistant)?final\s*(.*?)$', content, re.DOTALL)
-            if final_match:
-                final_content = final_match.group(1).strip()
-                # Everything before "final" is reasoning/analysis
-                reasoning = content[:final_match.start()].strip()
-            else:
-                # No "final" channel — treat entire text as content
-                # Remove "analysis" prefix if present
-                if content.startswith("analysis"):
-                    reasoning_match = re.match(r'analysis(.*?)(?:assistant|$)', content, re.DOTALL)
-                    if reasoning_match:
-                        reasoning = reasoning_match.group(1).strip()
-                        final_content = content[reasoning_match.end():].strip()
-                    else:
-                        final_content = content[len("analysis"):].strip()
-                else:
-                    final_content = content.strip()
+            return {
+                "qid": qid,
+                "question": question,
+                "answer": answer,
+                "reasoning": reasoning,
+                "num_tool_calls": tool_call_count,
+                "tool_calls": tool_calls_log,
+                "latency_s": elapsed,
+                "status": "success",
+            }
 
-            # Clean up reasoning: remove "assistant" prefixes
-            reasoning = re.sub(r'\bassistant\b', '', reasoning).strip()
-            # Remove repeated channel markers
-            reasoning = re.sub(r'\b(analysis|commentary)\b', '', reasoning).strip()
-
-            msg = {"role": "assistant", "content": final_content}
-            if reasoning:
-                msg["reasoning_content"] = reasoning
-
-            messages.append(msg)
-            print(f"  [qid={qid}] Final answer ({round_num} rounds, {total_tool_calls} tools, {len(final_content)} chars)")
-            break
-
+    elapsed = time.time() - t0
     return {
         "qid": qid,
         "question": question,
-        "messages": messages,
-        "num_rounds": round_num,
-        "num_tool_calls": total_tool_calls,
+        "answer": "",
+        "num_tool_calls": tool_call_count,
+        "tool_calls": tool_calls_log,
+        "latency_s": elapsed,
+        "status": "error",
     }
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+SAMPLE_QUESTIONS = [
+    {"qid": 1, "question": "What were the key findings of the most recent IPCC report on climate change?"},
+    {"qid": 2, "question": "Who is the current CEO of Anthropic, when was the company founded, and what is their stated mission regarding AI safety?"},
+    {"qid": 3, "question": "Describe the architecture and key innovations of the Mamba state space model."},
+    {"qid": 4, "question": "What is the current state of nuclear fusion energy research? Describe the NIF's ignition achievement."},
+    {"qid": 5, "question": "What is DR Tulu and how does it work?"},
+]
 
 
 async def run_generation(
@@ -194,8 +170,9 @@ async def run_generation(
     num_samples: int,
     concurrency: int,
     output_dir: str,
-    max_rounds: int,
+    max_tool_calls: int,
     max_gen_tokens: int,
+    temperature: float,
 ):
     from transformers import AutoTokenizer
 
@@ -203,57 +180,43 @@ async def run_generation(
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
     http_client = httpx.AsyncClient(timeout=60)
-    openai_http = httpx.AsyncClient(timeout=300)
+    openai_http = httpx.AsyncClient(timeout=600)
 
     # Load dataset
-    print(f"Loading dataset: {dataset_name}")
     if dataset_name == "sample":
-        data = [
-            {"qid": 1, "question": "What were the key findings of the most recent IPCC report on climate change, and how do they compare to the predictions made in the 2018 special report on 1.5°C warming?"},
-            {"qid": 2, "question": "Who is the current CEO of Anthropic, when was the company founded, and what is their stated mission regarding AI safety?"},
-            {"qid": 3, "question": "What is the latest breakthrough in room-temperature superconductivity research as of 2024, and what is the scientific consensus on the LK-99 claims?"},
-            {"qid": 4, "question": "Describe the architecture and key innovations of the Mamba state space model. How does it compare to Transformers in terms of computational complexity for long sequences?"},
-            {"qid": 5, "question": "What is the current state of nuclear fusion energy research? Describe the NIF's ignition achievement and the ITER project timeline."},
-        ]
+        data = SAMPLE_QUESTIONS
     else:
-        try:
-            sys.path.insert(0, "/tmp/OpenResearcher")
-            from data_utils import load_dataset
-            data = load_dataset(dataset_name)
-        except Exception as e:
-            print(f"Could not load dataset '{dataset_name}': {e}")
-            return
+        import datasets
+        ds = datasets.load_dataset(dataset_name, split="main")
+        data = [{"qid": row["id"], "question": row["question"]} for row in ds]
 
     if num_samples > 0:
         data = data[:num_samples]
 
     # Wait for workers
+    base_url = scheduler_url.rstrip("/")
     async with httpx.AsyncClient() as tmp:
-        resp = await tmp.get(f"{scheduler_url.rstrip('/')}/cluster_status")
-        status = resp.json()
-    print(f"Cluster: {status['ready_workers']} ready workers")
-
-    if status["ready_workers"] == 0:
-        print("⚠  No ready workers! Waiting...")
         for _ in range(120):
-            await asyncio.sleep(5)
-            async with httpx.AsyncClient() as tmp:
-                resp = await tmp.get(f"{scheduler_url.rstrip('/')}/cluster_status")
-                status = resp.json()
-            if status["ready_workers"] > 0:
-                print(f"✅ {status['ready_workers']} workers ready")
-                break
-            print(f"  Waiting... (ready={status['ready_workers']}, loading={status['loading_workers']})")
+            try:
+                resp = await tmp.get(f"{base_url}/cluster_status", timeout=5)
+                if resp.json().get("ready_workers", 0) > 0:
+                    print(f"Cluster: {resp.json()['ready_workers']} ready workers")
+                    break
+            except Exception:
+                pass
+            print("  Waiting for workers...")
+            await asyncio.sleep(10)
         else:
-            print("Timed out.")
+            print("Timed out waiting for workers.")
             return
 
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"trajectories_{dataset_name}.jsonl")
 
+    # Resume
     completed_qids = set()
     if os.path.exists(output_file):
-        with open(output_file, "r") as f:
+        with open(output_file) as f:
             for line in f:
                 try:
                     completed_qids.add(json.loads(line)["qid"])
@@ -274,29 +237,32 @@ async def run_generation(
     async def process_one(item):
         nonlocal completed
         async with sem:
-            t0 = time.time()
             try:
                 result = await generate_one_trajectory(
-                    question=item["question"], qid=item["qid"],
-                    base_url=scheduler_url.rstrip("/"), model=model,
-                    tokenizer=tokenizer, http_client=http_client,
-                    openai_http=openai_http, max_rounds=max_rounds,
+                    question=item["question"],
+                    qid=item["qid"],
+                    base_url=base_url,
+                    model=model,
+                    tokenizer=tokenizer,
+                    http_client=http_client,
+                    openai_http=openai_http,
+                    max_tool_calls=max_tool_calls,
                     max_gen_tokens=max_gen_tokens,
+                    temperature=temperature,
                 )
                 result["answer_ref"] = item.get("answer", "")
-                result["latency_s"] = time.time() - t0
-                result["status"] = "success"
-            except Exception as e:
+            except Exception:
                 result = {
-                    "qid": item["qid"], "question": item["question"],
-                    "messages": [], "error": traceback.format_exc(),
-                    "latency_s": time.time() - t0, "status": "fail",
+                    "qid": item["qid"],
+                    "question": item["question"],
+                    "error": traceback.format_exc(),
+                    "status": "error",
                 }
             completed += 1
             print(f"[{completed}/{len(pending)}] qid={item['qid']} "
-                  f"{result['status']} rounds={result.get('num_rounds',0)} "
-                  f"tools={result.get('num_tool_calls',0)} "
-                  f"time={result['latency_s']:.1f}s")
+                  f"{result.get('status', '?')} "
+                  f"tools={result.get('num_tool_calls', 0)} "
+                  f"time={result.get('latency_s', 0):.1f}s")
             return result
 
     tasks = [asyncio.create_task(process_one(item)) for item in pending]
@@ -308,19 +274,20 @@ async def run_generation(
 
     await http_client.aclose()
     await openai_http.aclose()
-    print(f"\n✅ Done! {output_file}")
+    print(f"\nDone! {output_file}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate SFT trajectories")
+    parser = argparse.ArgumentParser(description="Generate research trajectories")
     parser.add_argument("--scheduler-url", type=str,
                         default=os.environ.get("ELASTIC_SERVING_URL", "http://localhost:8780"))
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="sample")
     parser.add_argument("--num-samples", type=int, default=5)
     parser.add_argument("--concurrency", type=int, default=2)
-    parser.add_argument("--max-rounds", type=int, default=15)
+    parser.add_argument("--max-tool-calls", type=int, default=15)
     parser.add_argument("--max-gen-tokens", type=int, default=8192)
+    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--output-dir", type=str, default="results/trajectories")
     args = parser.parse_args()
 
@@ -332,10 +299,15 @@ def main():
             args.model = "default"
 
     asyncio.run(run_generation(
-        scheduler_url=args.scheduler_url, model=args.model,
-        dataset_name=args.dataset, num_samples=args.num_samples,
-        concurrency=args.concurrency, output_dir=args.output_dir,
-        max_rounds=args.max_rounds, max_gen_tokens=args.max_gen_tokens,
+        scheduler_url=args.scheduler_url,
+        model=args.model,
+        dataset_name=args.dataset,
+        num_samples=args.num_samples,
+        concurrency=args.concurrency,
+        output_dir=args.output_dir,
+        max_tool_calls=args.max_tool_calls,
+        max_gen_tokens=args.max_gen_tokens,
+        temperature=args.temperature,
     ))
 
 

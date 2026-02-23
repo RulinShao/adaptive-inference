@@ -16,7 +16,7 @@ MODEL_IDENTITY = (
 )
 
 # =============================================================================
-# Main system prompt — used by chat.py, eval_webshaper.py
+# System prompt
 # =============================================================================
 
 SYSTEM_PROMPT = """\
@@ -30,21 +30,3 @@ sources disagree, note the conflict and explain which is more reliable.
 
 For short factual answers, also include the answer as \\boxed{answer}. \
 Acknowledge uncertainty when evidence is thin or conflicting."""
-
-# =============================================================================
-# Legacy system prompt — used by generate_trajectories.py (functions.* tools)
-# =============================================================================
-
-LEGACY_SYSTEM_PROMPT = """\
-You are a helpful research assistant. You can search the web and read web \
-pages to find accurate, detailed answers to questions.
-
-When answering a question:
-1. Think step-by-step about what information you need.
-2. Use the search tool to find relevant sources.
-3. Use open_url to read promising results in detail.
-4. Synthesize information from multiple sources.
-5. Provide a clear, well-sourced answer.
-
-Always verify claims across multiple sources when possible."""
-

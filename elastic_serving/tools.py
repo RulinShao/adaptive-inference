@@ -6,35 +6,28 @@ This module provides:
   - Prompt building (``build_initial_prompt``, ``append_tool_round``, ``append_user_turn``)
   - Configuration constants (``STOP_TOKENS``, ``BUILTIN_TOOLS``, ``DEFAULT_MAX_TOOL_CALLS``)
 
-Tool implementations and prompts live in ``elastic_serving.deep_research_utils``:
-  - ``deep_research_tools.py`` — BrowserSession, paper_search, tool specs
-  - ``prompts.py``             — SYSTEM_PROMPT, MODEL_IDENTITY
+Tool implementations and prompts live in ``elastic_serving.dr_utils``:
+  - ``tools.py``    — BrowserSession, paper_search, tool specs
+  - ``prompts.py``  — SYSTEM_PROMPT, MODEL_IDENTITY
 
-This module re-exports the most commonly used symbols so that callers can
-do ``from elastic_serving.tools import ...`` without knowing the subpackage.
+This module re-exports commonly used symbols so callers can do
+``from elastic_serving.tools import ...`` without knowing the subpackage.
 """
 
 import json
 import re
 from typing import Dict, List, Optional, Tuple
 
-# Re-export tool implementations and prompts from deep_research_utils
-from elastic_serving.deep_research_utils import (  # noqa: F401
+# Re-export from dr_utils
+from elastic_serving.dr_utils import (  # noqa: F401
     CUSTOM_TOOLS,
-    LEGACY_SYSTEM_PROMPT,
-    LEGACY_TOOLS,
     MODEL_IDENTITY,
     PAPER_SEARCH_TOOL,
     SYSTEM_PROMPT,
     BrowserSession,
     execute_custom_tool,
-    execute_legacy_tool,
     paper_search,
 )
-
-# Backward-compat alias
-TOOLS = LEGACY_TOOLS
-execute_tool = execute_legacy_tool
 
 # =============================================================================
 # Configuration
@@ -134,7 +127,7 @@ def parse_tool_call(text: str) -> Optional[Tuple[str, str, dict]]:
     """Parse a tool call from raw model output.
 
     Returns ``(namespace, tool_name, args_dict)`` or ``None``.
-    Handles both ``to=browser.search`` and ``to=functions.paper_search``.
+    Handles both ``to=browser.*`` and ``to=functions.*`` tool calls.
     """
     m = re.search(r"to=(browser|functions)\.(\w+)", text)
     if not m:
@@ -174,42 +167,6 @@ def parse_tool_call(text: str) -> Optional[Tuple[str, str, dict]]:
         url_match = re.search(r'"id"\s*:\s*"(https?://[^"]*)"', args_str)
         if url_match:
             return namespace, tool_name, {"id": url_match.group(1)}
-
-    return None
-
-
-def parse_tool_call_from_raw(text: str) -> Optional[Tuple[str, dict]]:
-    """Legacy parser for ``to=functions.*`` tool calls (2-tuple return)."""
-    m = re.search(r"to=functions\.(\w+)", text)
-    if not m:
-        return None
-
-    tool_name = m.group(1)
-    msg_match = re.search(
-        r"<\|message\|>(.*?)(?:<\|call\|>|<\|end\|>|$)", text, re.DOTALL
-    )
-    if msg_match:
-        args_str = msg_match.group(1).strip()
-    else:
-        after = text[m.end():]
-        json_match = re.search(r"(?:json|code)\s*(\{.*?\})\s*$", after, re.DOTALL)
-        args_str = json_match.group(1) if json_match else after.strip()
-
-    if args_str.startswith('"') and args_str.endswith('"'):
-        try:
-            args_str = json.loads(args_str)
-        except Exception:
-            args_str = args_str[1:-1]
-
-    try:
-        return tool_name, json.loads(args_str)
-    except json.JSONDecodeError:
-        query_match = re.search(r'"query"\s*:\s*"([^"]*)"', args_str)
-        if query_match:
-            return tool_name, {"query": query_match.group(1)}
-        url_match = re.search(r'"url"\s*:\s*"([^"]*)"', args_str)
-        if url_match:
-            return tool_name, {"url": url_match.group(1)}
 
     return None
 
