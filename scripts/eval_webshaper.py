@@ -392,8 +392,20 @@ async def run_evaluation(
             print("Timed out waiting for workers.")
             return
 
-    http_client = httpx.AsyncClient(timeout=60)
-    openai_http = httpx.AsyncClient(timeout=600)
+    # Large connection pool + per-request timeouts to avoid deadlocks.
+    # Each external API (Serper, Jina, S2) gets its own pool slots.
+    pool_limits = httpx.Limits(
+        max_connections=concurrency * 4,
+        max_keepalive_connections=concurrency * 2,
+    )
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        limits=pool_limits,
+    )
+    openai_http = httpx.AsyncClient(
+        timeout=httpx.Timeout(600.0, connect=10.0),
+        limits=pool_limits,
+    )
     judge_http = httpx.AsyncClient(timeout=60)
 
     sem = asyncio.Semaphore(concurrency)
@@ -409,20 +421,34 @@ async def run_evaluation(
                 return completed[key]
 
             try:
-                result = await generate_trajectory(
-                    question=item["question"],
-                    qid=qid[:8],
-                    base_url=base_url,
-                    model=model,
-                    tokenizer=tokenizer,
-                    http_client=http_client,
-                    openai_http=openai_http,
-                    traj_idx=traj_idx,
-                    max_tool_calls=max_tool_calls,
-                    temperature=temperature,
-                    save_conversation=save_conversation,
+                result = await asyncio.wait_for(
+                    generate_trajectory(
+                        question=item["question"],
+                        qid=qid[:8],
+                        base_url=base_url,
+                        model=model,
+                        tokenizer=tokenizer,
+                        http_client=http_client,
+                        openai_http=openai_http,
+                        traj_idx=traj_idx,
+                        max_tool_calls=max_tool_calls,
+                        temperature=temperature,
+                        save_conversation=save_conversation,
+                    ),
+                    timeout=900,  # 15 min hard limit per trajectory
                 )
                 result["reference_answer"] = item["answer"]
+            except asyncio.TimeoutError:
+                result = {
+                    "qid": qid,
+                    "traj_idx": traj_idx,
+                    "question": item["question"],
+                    "answer": "",
+                    "reference_answer": item["answer"],
+                    "error": "trajectory timeout (900s)",
+                    "status": "timeout",
+                    "latency_s": 900,
+                }
             except Exception as e:
                 result = {
                     "qid": qid,
