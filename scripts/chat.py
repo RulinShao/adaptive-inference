@@ -36,9 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 dotenv.load_dotenv()
 
 from elastic_serving.tools import (
-    BUILTIN_TOOLS,
     DEFAULT_MAX_TOOL_CALLS,
-    MODEL_IDENTITY,
     STOP_TOKENS,
     STOP_TOKENS_NO_CALL,
     SYSTEM_PROMPT,
@@ -46,6 +44,7 @@ from elastic_serving.tools import (
     append_tool_round,
     append_user_turn,
     build_initial_prompt,
+    execute_custom_tool,
     extract_final_answer,
     parse_tool_call,
 )
@@ -73,11 +72,11 @@ def cprint(text: str, color: str = "", end: str = "\n"):
     print(f"{color}{text}{C.RESET}", end=end)
 
 
-def print_tool_call(name: str, args: dict):
+def print_tool_call(namespace: str, name: str, args: dict):
     short = json.dumps(args, ensure_ascii=False)
     if len(short) > 120:
         short = short[:117] + "..."
-    cprint(f"  🔧 browser.{name}({short})", C.YELLOW)
+    cprint(f"  🔧 {namespace}.{name}({short})", C.YELLOW)
 
 
 def print_tool_result(result: str, max_lines: int = 8):
@@ -117,6 +116,7 @@ async def chat_turn(
     base_url: str,
     model: str,
     browser: BrowserSession,
+    http_client: httpx.AsyncClient,
     openai_http: httpx.AsyncClient,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_gen_tokens: int = 8192,
@@ -206,16 +206,23 @@ async def chat_turn(
         tool_call = parse_tool_call(raw_text) if not at_limit else None
 
         if tool_call:
-            tool_name, tool_args = tool_call
+            ns, tool_name, tool_args = tool_call
             tool_call_count += 1
-            print_tool_call(tool_name, tool_args)
+            print_tool_call(ns, tool_name, tool_args)
 
-            # Execute
-            result = await browser.execute(tool_name, tool_args)
+            # Execute — browser.* or functions.*
+            if ns == "browser":
+                result = await browser.execute(tool_name, tool_args)
+            else:
+                result = await execute_custom_tool(
+                    tool_name, tool_args, http_client
+                )
             print_tool_result(result)
 
             # Extend raw prompt
-            prompt = append_tool_round(prompt, raw_text, tool_name, result)
+            prompt = append_tool_round(
+                prompt, raw_text, tool_name, result, namespace=ns
+            )
             continue
         else:
             # Final answer
@@ -260,7 +267,7 @@ async def interactive_chat(
     cprint("╚══════════════════════════════════════════════════╝", C.CYAN)
     cprint(f"  Model:      {model}", C.GRAY)
     cprint(f"  Server:     {base_url}", C.GRAY)
-    cprint(f"  Tools:      browser.search, browser.open, browser.find", C.GRAY)
+    cprint(f"  Tools:      browser.search, browser.open, browser.find, snippet_search", C.GRAY)
     cprint(f"  Max calls:  {max_tool_calls} per turn", C.GRAY)
     print()
     cprint("  Commands: /clear  — reset conversation", C.GRAY)
@@ -323,6 +330,7 @@ async def interactive_chat(
             base_url=base_url,
             model=model,
             browser=browser,
+            http_client=http_client,
             openai_http=openai_http,
             max_tool_calls=max_tool_calls,
             max_gen_tokens=max_gen_tokens,

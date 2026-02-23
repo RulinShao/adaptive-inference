@@ -45,6 +45,7 @@ from elastic_serving.tools import (
     BrowserSession,
     append_tool_round,
     build_initial_prompt,
+    execute_custom_tool,
     extract_final_answer,
     parse_tool_call,
 )
@@ -156,22 +157,29 @@ async def generate_trajectory(
         tool_call = parse_tool_call(raw_text) if not at_limit else None
 
         if tool_call:
-            tool_name, tool_args = tool_call
+            ns, tool_name, tool_args = tool_call
             tool_call_count += 1
 
             short_args = json.dumps(tool_args, ensure_ascii=False)[:100]
             print(f"  [{tag}] Tool {tool_call_count}/{max_tool_calls}: "
-                  f"browser.{tool_name}({short_args})")
+                  f"{ns}.{tool_name}({short_args})")
 
-            result = await browser.execute(tool_name, tool_args)
+            if ns == "browser":
+                result = await browser.execute(tool_name, tool_args)
+            else:
+                result = await execute_custom_tool(
+                    tool_name, tool_args, http_client
+                )
             tool_calls_log.append({
                 "round": tool_call_count,
-                "tool": f"browser.{tool_name}",
+                "tool": f"{ns}.{tool_name}",
                 "args": tool_args,
                 "result_len": len(result),
             })
 
-            prompt = append_tool_round(prompt, raw_text, tool_name, result)
+            prompt = append_tool_round(
+                prompt, raw_text, tool_name, result, namespace=ns
+            )
             continue
         else:
             # Final answer

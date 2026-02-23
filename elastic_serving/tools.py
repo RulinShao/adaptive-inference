@@ -1,18 +1,20 @@
 """
-Browser-compatible tools for Elastic Serving (Harmony native format).
+Browser + academic search tools for Elastic Serving (Harmony native format).
 
-Aligns with the Harmony chat template's built-in ``browser`` namespace:
-  browser.search → backed by Serper API
-  browser.open   → backed by Jina Reader API
-  browser.find   → local text search in opened pages
+Tool namespaces:
+  browser.*          — built-in Harmony tools (web search, open, find)
+                       backed by Serper API + Jina Reader API
+  functions.*        — custom tools rendered in the developer message
+    snippet_search   — academic paper search via Semantic Scholar API
 
-Uses ``builtin_tools=["browser"]`` with ``tokenizer.apply_chat_template``
-so the model sees its native browser tool spec.  After the initial prompt,
+Uses ``builtin_tools=["browser"]`` + ``tools=[SNIPPET_SEARCH_TOOL]`` with
+``tokenizer.apply_chat_template`` so the model sees the native browser
+spec *and* the custom snippet_search tool.  After the initial prompt,
 multi-round tool calls are handled by extending the raw prompt string
 directly (the template cannot render ``browser.*`` tool responses).
 
-Also keeps the legacy ``functions.*`` helpers for backward compatibility
-with ``generate_trajectories.py``.
+Also keeps legacy ``functions.search`` / ``functions.open_url`` helpers
+for backward compatibility with ``generate_trajectories.py``.
 """
 
 import json
@@ -30,33 +32,113 @@ BUILTIN_TOOLS: List[str] = ["browser"]
 """Passed to ``apply_chat_template(builtin_tools=...)``."""
 
 DEFAULT_MAX_TOOL_CALLS = 15
-"""Default cap on browser tool calls per user turn."""
+"""Default cap on tool calls per user turn."""
 
 MODEL_IDENTITY = (
-    "You are a deep research assistant that can browse the web to "
-    "provide thorough, accurate, and well-sourced answers."
+    "You are a deep research assistant that can browse the web and search "
+    "academic papers to provide thorough, accurate, and well-sourced answers."
 )
 """Overrides the default 'You are ChatGPT...' in the Harmony system message."""
 
 SYSTEM_PROMPT = """\
-Use the browser tools to search the web and read pages to find accurate, \
-up-to-date information. Follow this research approach:
+You answer questions through iterative research. You have access to web \
+browsing tools and an academic paper search tool.
 
-1. **Analyze** the question — identify what specific information you need.
-2. **Search** with browser.search — use specific queries; refine if needed.
-3. **Read** with browser.open — open the most promising results by their id.
-4. **Verify** — cross-reference claims across multiple sources.
-5. **Iterate** — do additional search/read rounds until you have enough detail.
+## Process
 
-Cite information from browsing using the cursor format shown in the tools \
-section (e.g. 【3†L15-L20】). Acknowledge uncertainty when sources conflict. \
-Structure your final answer with clear organization."""
+Research iteratively until you have enough evidence for a complete answer:
+
+1. **Think** about what information you need and plan your searches.
+2. **Search** — use browser.search for web content, or snippet_search for \
+academic papers and scientific data.
+3. **Read** — use browser.open to read the most promising results in detail. \
+Use browser.find to locate specific information in long pages.
+4. **Think again** — do you have enough evidence? If not, search more with \
+refined queries. Multiple rounds of search → read → search are expected.
+5. **Answer** — only provide your final answer when you have sufficient \
+evidence. Support every non-trivial claim with retrieved evidence.
+
+## Tools
+
+- **browser.search**(query) — general web search.
+- **browser.open**(id) — open a link from search results by its id, or pass \
+a URL string directly.
+- **browser.find**(pattern) — find exact text matches in the current page.
+- **snippet_search**(query) — search academic papers via Semantic Scholar. \
+Returns paper titles, abstracts, authors, and URLs. Use optional parameters: \
+limit (max results, default 5), year (e.g. "2023-2025"), \
+fields_of_study (e.g. "Computer Science,Medicine").
+
+## Citation
+
+Cite information from browsing using the cursor citation format shown in \
+the tools section (e.g. 【3†L15-L20】). Support claims with evidence from \
+your searches. If sources disagree, note the conflict and explain which \
+source is more reliable.
+
+## Answer Format
+
+- Provide a comprehensive, well-structured answer with clear organization.
+- For short factual answers, also include the answer as \\boxed{answer}.
+- Acknowledge uncertainty when evidence is thin or conflicting."""
 
 STOP_TOKENS = ["<|call|>", "<|end|>", "<|endoftext|>"]
 """vLLM stop strings for Harmony generation."""
 
 STOP_TOKENS_NO_CALL = ["<|end|>", "<|endoftext|>"]
 """Stop strings that force a final answer (no more tool calls)."""
+
+
+# =============================================================================
+# snippet_search tool definition (custom functions namespace)
+# =============================================================================
+
+SNIPPET_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "snippet_search",
+        "description": (
+            "Search academic papers via Semantic Scholar. Returns paper "
+            "titles, abstracts, authors, publication year, and URLs. "
+            "Use this for scientific questions, research findings, "
+            "benchmarks, and peer-reviewed evidence."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query for academic papers.",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": (
+                        "Maximum number of papers to return (default: 5)."
+                    ),
+                },
+                "year": {
+                    "type": "string",
+                    "description": (
+                        "Publication year filter. A single year (e.g. '2024') "
+                        "or a range (e.g. '2022-2025')."
+                    ),
+                },
+                "fields_of_study": {
+                    "type": "string",
+                    "description": (
+                        "Comma-separated fields of study to filter by. "
+                        "Examples: 'Computer Science', 'Medicine', "
+                        "'Computer Science,Physics'."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+CUSTOM_TOOLS = [SNIPPET_SEARCH_TOOL]
+"""Passed to ``apply_chat_template(tools=...)``."""
 
 
 # =============================================================================
@@ -285,6 +367,102 @@ class BrowserSession:
 
 
 # =============================================================================
+# snippet_search — academic paper search via Semantic Scholar
+# =============================================================================
+
+SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+SEMANTIC_SCHOLAR_FIELDS = (
+    "title,abstract,authors,year,url,citationCount,externalIds"
+)
+
+
+async def snippet_search(
+    query: str,
+    http_client: httpx.AsyncClient,
+    limit: int = 5,
+    year: Optional[str] = None,
+    fields_of_study: Optional[str] = None,
+) -> str:
+    """Search academic papers via Semantic Scholar API."""
+    params: Dict[str, Any] = {
+        "query": query,
+        "limit": min(limit, 20),
+        "fields": SEMANTIC_SCHOLAR_FIELDS,
+    }
+    if year:
+        params["year"] = year
+    if fields_of_study:
+        params["fieldsOfStudy"] = fields_of_study
+
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+    headers = {}
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        resp = await http_client.get(
+            SEMANTIC_SCHOLAR_API,
+            params=params,
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return f"Snippet search error: {e}"
+
+    papers = data.get("data", [])
+    if not papers:
+        return f"No academic papers found for: {query}"
+
+    lines = [f'Academic paper search: "{query}"', ""]
+    for i, p in enumerate(papers, 1):
+        title = p.get("title", "Untitled")
+        year_val = p.get("year", "")
+        citations = p.get("citationCount", 0)
+        authors = p.get("authors", [])
+        author_str = ", ".join(a.get("name", "") for a in authors[:4])
+        if len(authors) > 4:
+            author_str += " et al."
+        abstract = p.get("abstract", "") or ""
+        if len(abstract) > 500:
+            abstract = abstract[:500] + "..."
+        url = p.get("url", "")
+        ext = p.get("externalIds", {})
+        doi = ext.get("DOI", "")
+
+        lines.append(f"[{i}] {title}")
+        if author_str:
+            lines.append(f"    Authors: {author_str}")
+        if year_val:
+            lines.append(f"    Year: {year_val} | Citations: {citations}")
+        if doi:
+            lines.append(f"    DOI: {doi}")
+        if url:
+            lines.append(f"    URL: {url}")
+        if abstract:
+            lines.append(f"    Abstract: {abstract}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+async def execute_custom_tool(
+    name: str, args: dict, http_client: httpx.AsyncClient
+) -> str:
+    """Dispatch a ``functions.*`` tool call (custom tools)."""
+    if name == "snippet_search":
+        return await snippet_search(
+            query=args.get("query", ""),
+            http_client=http_client,
+            limit=int(args.get("limit", 5)),
+            year=args.get("year"),
+            fields_of_study=args.get("fields_of_study"),
+        )
+    return f"Unknown custom tool: {name}"
+
+
+# =============================================================================
 # Prompt helpers — build & extend raw Harmony prompts
 # =============================================================================
 
@@ -294,6 +472,7 @@ def build_initial_prompt(
     user_message: str,
     system_prompt: str = SYSTEM_PROMPT,
     model_identity: str = MODEL_IDENTITY,
+    custom_tools: Optional[List[dict]] = None,
     history: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Build the initial prompt using ``apply_chat_template``.
@@ -313,13 +492,17 @@ def build_initial_prompt(
 
     messages.append({"role": "user", "content": user_message})
 
-    return tokenizer.apply_chat_template(
-        messages,
-        builtin_tools=BUILTIN_TOOLS,
-        model_identity=model_identity,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    kwargs = {
+        "builtin_tools": BUILTIN_TOOLS,
+        "model_identity": model_identity,
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    tools = custom_tools if custom_tools is not None else CUSTOM_TOOLS
+    if tools:
+        kwargs["tools"] = tools
+
+    return tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def append_tool_round(
@@ -327,17 +510,21 @@ def append_tool_round(
     model_output: str,
     tool_name: str,
     tool_response: str,
+    namespace: str = "browser",
 ) -> str:
-    """Extend the raw prompt with a browser tool call + response.
+    """Extend the raw prompt with a tool call + response.
 
     ``model_output`` is the raw text from vLLM (does NOT include the
     ``<|call|>`` stop token).  We append it, then the tool response in
     native Harmony format, then the generation prompt for the next round.
+
+    ``namespace`` is ``"browser"`` for built-in tools or ``"functions"``
+    for custom tools (e.g. snippet_search).
     """
     return (
         f"{prompt}{model_output}"
         f"<|call|>"
-        f"<|start|>browser.{tool_name} to=assistant"
+        f"<|start|>{namespace}.{tool_name} to=assistant"
         f"<|channel|>commentary<|message|>"
         f"{json.dumps(tool_response)}"
         f"<|end|>"
@@ -364,18 +551,18 @@ def append_user_turn(prompt: str, final_answer_text: str, user_message: str) -> 
 # =============================================================================
 
 
-def parse_tool_call(text: str) -> Optional[Tuple[str, dict]]:
-    """Parse a ``to=browser.*`` tool call from raw model output.
+def parse_tool_call(text: str) -> Optional[Tuple[str, str, dict]]:
+    """Parse a tool call from raw model output.
 
-    Returns ``(tool_name, args_dict)`` or ``None``.
-    The model generates e.g.:
-      ``to=browser.search<|channel|>commentary json<|message|>{"query":"..."}``
+    Returns ``(namespace, tool_name, args_dict)`` or ``None``.
+    Handles both ``to=browser.search`` and ``to=functions.snippet_search``.
     """
-    m = re.search(r"to=browser\.(\w+)", text)
+    m = re.search(r"to=(browser|functions)\.(\w+)", text)
     if not m:
         return None
 
-    tool_name = m.group(1)
+    namespace = m.group(1)
+    tool_name = m.group(2)
 
     # Args after <|message|>
     msg_match = re.search(
@@ -397,20 +584,20 @@ def parse_tool_call(text: str) -> Optional[Tuple[str, dict]]:
 
     try:
         args = json.loads(args_str)
-        return tool_name, args
+        return namespace, tool_name, args
     except json.JSONDecodeError:
         # Fallback: extract known fields
         for field in ("query", "pattern"):
             match = re.search(rf'"{field}"\s*:\s*"([^"]*)"', args_str)
             if match:
-                return tool_name, {field: match.group(1)}
+                return namespace, tool_name, {field: match.group(1)}
         id_match = re.search(r'"id"\s*:\s*(\d+)', args_str)
         if id_match:
-            return tool_name, {"id": int(id_match.group(1))}
+            return namespace, tool_name, {"id": int(id_match.group(1))}
         # URL as id
         url_match = re.search(r'"id"\s*:\s*"(https?://[^"]*)"', args_str)
         if url_match:
-            return tool_name, {"id": url_match.group(1)}
+            return namespace, tool_name, {"id": url_match.group(1)}
 
     return None
 
