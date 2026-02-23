@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Interactive CLI Chat with Tool Use (Harmony Format)
-=====================================================
+Interactive CLI Chat with Browser Tools (Harmony Native Format)
+================================================================
 
-Chat with a model served by Elastic Serving. The model can use web search
-(Serper) and URL reading (Jina) tools via native Harmony token format.
-Reasoning (analysis channel) is shown dimmed; the final answer is highlighted.
+Chat with a model served by Elastic Serving.  The model uses the native
+Harmony ``browser`` namespace (``browser.search``, ``browser.open``,
+``browser.find``) backed by Serper (search) and Jina (URL reader).
+
+Reasoning (analysis channel) is shown dimmed; the final answer is
+highlighted.
 
 Usage:
     python scripts/chat.py --scheduler-url http://localhost:8780
-    python scripts/chat.py --scheduler-url http://localhost:8780 --model /path/to/model
+    python scripts/chat.py --scheduler-url http://localhost:8780 --verbose
+    python scripts/chat.py --max-tool-calls 10 --temperature 0.9
 
 Environment:
-    SERPER_API_KEY   — for web search (Serper)
-    JINA_API_KEY     — for URL reading (Jina Reader)
-    ELASTIC_SERVING_URL — default scheduler URL
+    SERPER_API_KEY       — for web search (Serper)
+    JINA_API_KEY         — for URL reading (Jina Reader)
+    ELASTIC_SERVING_URL  — default scheduler URL
 """
 
 import argparse
@@ -32,16 +36,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 dotenv.load_dotenv()
 
 from elastic_serving.tools import (
+    BUILTIN_TOOLS,
+    DEFAULT_MAX_TOOL_CALLS,
+    MODEL_IDENTITY,
+    STOP_TOKENS,
+    STOP_TOKENS_NO_CALL,
     SYSTEM_PROMPT,
-    TOOLS,
-    execute_tool,
+    BrowserSession,
+    append_tool_round,
+    append_user_turn,
+    build_initial_prompt,
     extract_final_answer,
-    parse_tool_call_from_raw,
+    parse_tool_call,
 )
 
 # =============================================================================
-# ANSI colors for terminal output
+# ANSI colors
 # =============================================================================
+
 
 class C:
     RESET = "\033[0m"
@@ -57,15 +69,15 @@ class C:
     GRAY = "\033[90m"
 
 
-def print_colored(text: str, color: str = "", end: str = "\n"):
+def cprint(text: str, color: str = "", end: str = "\n"):
     print(f"{color}{text}{C.RESET}", end=end)
 
 
 def print_tool_call(name: str, args: dict):
-    args_short = json.dumps(args, ensure_ascii=False)
-    if len(args_short) > 120:
-        args_short = args_short[:117] + "..."
-    print_colored(f"  🔧 {name}({args_short})", C.YELLOW)
+    short = json.dumps(args, ensure_ascii=False)
+    if len(short) > 120:
+        short = short[:117] + "..."
+    cprint(f"  🔧 browser.{name}({short})", C.YELLOW)
 
 
 def print_tool_result(result: str, max_lines: int = 8):
@@ -74,20 +86,20 @@ def print_tool_result(result: str, max_lines: int = 8):
     if len(lines) > max_lines:
         preview += f"\n  ... ({len(lines) - max_lines} more lines)"
     for line in preview.split("\n"):
-        print_colored(f"  │ {line}", C.GRAY)
+        cprint(f"  │ {line}", C.GRAY)
 
 
 def print_reasoning(text: str):
     if not text.strip():
         return
-    print_colored("  💭 Reasoning:", C.DIM + C.ITALIC)
+    cprint("  💭 Reasoning:", C.DIM + C.ITALIC)
     for line in text.strip().split("\n"):
-        print_colored(f"  │ {line}", C.DIM)
+        cprint(f"  │ {line}", C.DIM)
     print()
 
 
 def print_answer(text: str):
-    print_colored("  📝 Answer:", C.BOLD + C.GREEN)
+    cprint("  📝 Answer:", C.BOLD + C.GREEN)
     print()
     for line in text.strip().split("\n"):
         print(f"  {line}")
@@ -100,46 +112,41 @@ def print_answer(text: str):
 
 
 async def chat_turn(
-    messages: list,
+    *,
+    prompt: str,
     base_url: str,
     model: str,
-    tokenizer,
-    http_client: httpx.AsyncClient,
+    browser: BrowserSession,
     openai_http: httpx.AsyncClient,
-    max_rounds: int = 15,
+    max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_gen_tokens: int = 8192,
     temperature: float = 0.7,
     verbose: bool = False,
-):
+) -> tuple:
     """
-    Run one user turn: generate assistant response with tool-call loop.
-    Modifies `messages` in place. Returns the final answer string.
+    Run one user turn with the tool-call loop.
+
+    Returns ``(final_raw_text, updated_prompt)`` where *updated_prompt*
+    includes all tool rounds so far (for multi-turn reuse).
     """
-    stop_tokens = ["<|call|>", "<|end|>", "<|endoftext|>"]
-    round_num = 0
+    tool_call_count = 0
 
-    while round_num < max_rounds:
-        round_num += 1
-        is_last_round = (round_num == max_rounds)
-        current_stops = ["<|end|>", "<|endoftext|>"] if is_last_round else stop_tokens
-
-        # Build prompt via tokenizer
-        prompt = tokenizer.apply_chat_template(
-            messages, tools=TOOLS, tokenize=False, add_generation_prompt=True,
-        )
-        prompt_tokens = len(tokenizer.encode(prompt))
+    while True:
+        at_limit = tool_call_count >= max_tool_calls
+        stops = STOP_TOKENS_NO_CALL if at_limit else STOP_TOKENS
 
         if verbose:
-            suffix = " (final)" if is_last_round else ""
-            print_colored(
-                f"  ⏳ Round {round_num}/{max_rounds} "
-                f"({prompt_tokens} prompt tokens){suffix}",
+            prompt_tokens = len(prompt) // 4  # rough estimate
+            suffix = " (final — tool limit)" if at_limit else ""
+            cprint(
+                f"  ⏳ Round {tool_call_count + 1} "
+                f"(~{prompt_tokens} prompt tokens){suffix}",
                 C.GRAY,
             )
 
-        # Generate via /v1/completions (with retry on 503 / no workers)
+        # Generate via /v1/completions (with retry on 503)
         t0 = time.time()
-        max_retries = 60  # up to ~5 min of waiting
+        max_retries = 60
         for attempt in range(max_retries):
             try:
                 resp = await openai_http.post(
@@ -149,96 +156,66 @@ async def chat_turn(
                         "prompt": prompt,
                         "max_tokens": max_gen_tokens,
                         "temperature": temperature,
-                        "stop": current_stops,
+                        "stop": stops,
                     },
                     headers={"Authorization": "Bearer EMPTY"},
                     timeout=300,
                 )
                 if resp.status_code == 503:
-                    # No ready workers — wait and retry
                     if attempt == 0:
-                        print_colored(
-                            "  ⏳ No ready workers yet, waiting for "
-                            "SLURM jobs to start...",
+                        cprint(
+                            "  ⏳ No ready workers yet, waiting...",
                             C.YELLOW,
                         )
-                    # Show a dot every 5 retries for progress
                     if attempt > 0 and attempt % 5 == 0:
-                        elapsed_wait = attempt * 5
-                        print_colored(
-                            f"  ⏳ Still waiting... ({elapsed_wait}s)",
-                            C.GRAY,
-                        )
+                        cprint(f"  ⏳ Still waiting... ({attempt * 5}s)", C.GRAY)
                     await asyncio.sleep(5)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
                 raw_text = data["choices"][0]["text"]
-                finish_reason = data["choices"][0].get("finish_reason", "")
                 break
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 503:
                     if attempt == 0:
-                        print_colored(
-                            "  ⏳ No ready workers yet, waiting for "
-                            "SLURM jobs to start...",
-                            C.YELLOW,
-                        )
+                        cprint("  ⏳ No ready workers, waiting...", C.YELLOW)
                     await asyncio.sleep(5)
                     continue
-                print_colored(f"  ❌ Generation error: {e}", C.RED)
-                messages.append({"role": "assistant", "content": f"[Error: {e}]"})
-                return f"[Error: {e}]"
+                cprint(f"  ❌ Generation error: {e}", C.RED)
+                return f"[Error: {e}]", prompt
             except Exception as e:
-                print_colored(f"  ❌ Generation error: {e}", C.RED)
-                messages.append({"role": "assistant", "content": f"[Error: {e}]"})
-                return f"[Error: {e}]"
+                cprint(f"  ❌ Generation error: {e}", C.RED)
+                return f"[Error: {e}]", prompt
         else:
-            msg = "Timed out waiting for workers to become ready."
-            print_colored(f"  ❌ {msg}", C.RED)
-            messages.append({"role": "assistant", "content": f"[{msg}]"})
-            return f"[{msg}]"
+            msg = "Timed out waiting for workers."
+            cprint(f"  ❌ {msg}", C.RED)
+            return f"[{msg}]", prompt
 
         elapsed = time.time() - t0
-        gen_tokens = data.get("usage", {}).get("completion_tokens", len(raw_text) // 4)
         if verbose:
-            print_colored(
-                f"  ⏱  Generated {gen_tokens} tokens in {elapsed:.1f}s "
-                f"({gen_tokens / max(elapsed, 0.01):.0f} tok/s)",
+            gen_tok = data.get("usage", {}).get(
+                "completion_tokens", len(raw_text) // 4
+            )
+            cprint(
+                f"  ⏱  {gen_tok} tokens in {elapsed:.1f}s "
+                f"({gen_tok / max(elapsed, 0.01):.0f} tok/s)",
                 C.GRAY,
             )
 
-        # Check for tool call
-        tool_call = parse_tool_call_from_raw(raw_text) if not is_last_round else None
+        # Try to parse a browser tool call
+        tool_call = parse_tool_call(raw_text) if not at_limit else None
 
         if tool_call:
             tool_name, tool_args = tool_call
+            tool_call_count += 1
             print_tool_call(tool_name, tool_args)
 
-            # Record tool call in messages
-            call_id = f"call_{round_num}"
-            messages.append({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(tool_args),
-                    },
-                }],
-            })
-
-            # Execute tool
-            result = await execute_tool(tool_name, tool_args, http_client)
+            # Execute
+            result = await browser.execute(tool_name, tool_args)
             print_tool_result(result)
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": result,
-            })
+            # Extend raw prompt
+            prompt = append_tool_round(prompt, raw_text, tool_name, result)
             continue
         else:
             # Final answer
@@ -247,15 +224,8 @@ async def chat_turn(
                 print_reasoning(reasoning)
             print_answer(answer)
 
-            # Store in messages for multi-turn context
-            msg = {"role": "assistant", "content": answer}
-            if reasoning:
-                msg["reasoning_content"] = reasoning
-            messages.append(msg)
-
-            return answer
-
-    return "[Max rounds reached without final answer]"
+            # The raw_text includes the model's final output (stopped at <|end|>)
+            return answer, prompt + raw_text
 
 
 # =============================================================================
@@ -267,7 +237,7 @@ async def interactive_chat(
     scheduler_url: str,
     model: str,
     tokenizer,
-    max_rounds: int = 15,
+    max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_gen_tokens: int = 8192,
     temperature: float = 0.7,
     verbose: bool = False,
@@ -275,27 +245,28 @@ async def interactive_chat(
 ):
     http_client = httpx.AsyncClient(timeout=60)
     openai_http = httpx.AsyncClient(timeout=300)
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ]
+    browser = BrowserSession(http_client)
 
     base_url = scheduler_url.rstrip("/")
 
+    # State: raw_prompt carries the full conversation so prefix-caching works
+    raw_prompt: str = ""
+    turn_count = 0
+
     # Header
     print()
-    print_colored("╔══════════════════════════════════════════════════╗", C.CYAN)
-    print_colored("║     Elastic Serving — Interactive Research Chat  ║", C.CYAN)
-    print_colored("╚══════════════════════════════════════════════════╝", C.CYAN)
-    print_colored(f"  Model:    {model}", C.GRAY)
-    print_colored(f"  Server:   {base_url}", C.GRAY)
-    print_colored(f"  Tools:    search, open_url", C.GRAY)
-    print_colored(f"  Rounds:   up to {max_rounds} per turn", C.GRAY)
+    cprint("╔══════════════════════════════════════════════════╗", C.CYAN)
+    cprint("║     Elastic Serving — Interactive Research Chat  ║", C.CYAN)
+    cprint("╚══════════════════════════════════════════════════╝", C.CYAN)
+    cprint(f"  Model:      {model}", C.GRAY)
+    cprint(f"  Server:     {base_url}", C.GRAY)
+    cprint(f"  Tools:      browser.search, browser.open, browser.find", C.GRAY)
+    cprint(f"  Max calls:  {max_tool_calls} per turn", C.GRAY)
     print()
-    print_colored("  Commands: /clear  — reset conversation", C.GRAY)
-    print_colored("            /system — show/change system prompt", C.GRAY)
-    print_colored("            /verbose — toggle verbose mode", C.GRAY)
-    print_colored("            /quit or Ctrl+C — exit", C.GRAY)
+    cprint("  Commands: /clear  — reset conversation", C.GRAY)
+    cprint("            /system — show system prompt", C.GRAY)
+    cprint("            /verbose — toggle verbose mode", C.GRAY)
+    cprint("            /quit or Ctrl+C — exit", C.GRAY)
     print()
 
     while True:
@@ -303,7 +274,7 @@ async def interactive_chat(
             user_input = input(f"{C.BOLD}{C.BLUE}You ❯ {C.RESET}").strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            print_colored("Goodbye!", C.CYAN)
+            cprint("Goodbye!", C.CYAN)
             break
 
         if not user_input:
@@ -311,59 +282,57 @@ async def interactive_chat(
 
         # Commands
         if user_input.lower() in ("/quit", "/exit", "/q"):
-            print_colored("Goodbye!", C.CYAN)
+            cprint("Goodbye!", C.CYAN)
             break
-
         if user_input.lower() == "/clear":
-            messages = [{"role": "system", "content": system_prompt}]
-            print_colored("  ✅ Conversation cleared.", C.GREEN)
+            raw_prompt = ""
+            turn_count = 0
+            browser = BrowserSession(http_client)
+            cprint("  ✅ Conversation cleared.", C.GREEN)
             continue
-
         if user_input.lower() == "/system":
-            print_colored("  Current system prompt:", C.GRAY)
+            cprint("  Current system prompt:", C.GRAY)
             for line in system_prompt.split("\n"):
-                print_colored(f"  │ {line}", C.GRAY)
+                cprint(f"  │ {line}", C.GRAY)
             continue
-
         if user_input.lower() == "/verbose":
             verbose = not verbose
-            print_colored(f"  Verbose mode: {'ON' if verbose else 'OFF'}", C.GREEN)
+            cprint(f"  Verbose mode: {'ON' if verbose else 'OFF'}", C.GREEN)
             continue
 
-        if user_input.lower() == "/history":
-            print_colored(f"  Conversation: {len(messages)} messages", C.GRAY)
-            for i, m in enumerate(messages):
-                role = m["role"]
-                content = m.get("content", "")
-                preview = content[:80] + "..." if len(content) > 80 else content
-                tc = m.get("tool_calls")
-                if tc:
-                    preview = f"[tool_call: {tc[0]['function']['name']}]"
-                print_colored(f"  [{i}] {role}: {preview}", C.GRAY)
-            continue
+        # Build prompt
+        if turn_count == 0:
+            # First turn: use apply_chat_template for correct Harmony framing
+            raw_prompt = build_initial_prompt(
+                tokenizer,
+                user_message=user_input,
+                system_prompt=system_prompt,
+            )
+        else:
+            # Subsequent turns: extend the raw prompt directly
+            raw_prompt = append_user_turn(raw_prompt, "", user_input)
 
-        # Add user message
-        messages.append({"role": "user", "content": user_input})
+        turn_count += 1
 
         print()
-        print_colored(f"{'─' * 60}", C.GRAY)
+        cprint(f"{'─' * 60}", C.GRAY)
 
         t0 = time.time()
-        await chat_turn(
-            messages=messages,
+        answer, raw_prompt = await chat_turn(
+            prompt=raw_prompt,
             base_url=base_url,
             model=model,
-            tokenizer=tokenizer,
-            http_client=http_client,
+            browser=browser,
             openai_http=openai_http,
-            max_rounds=max_rounds,
+            max_tool_calls=max_tool_calls,
             max_gen_tokens=max_gen_tokens,
             temperature=temperature,
             verbose=verbose,
         )
         elapsed = time.time() - t0
-        print_colored(f"{'─' * 60}", C.GRAY)
-        print_colored(f"  ⏱  Total turn: {elapsed:.1f}s", C.GRAY)
+
+        cprint(f"{'─' * 60}", C.GRAY)
+        cprint(f"  ⏱  Total turn: {elapsed:.1f}s", C.GRAY)
         print()
 
     await http_client.aclose()
@@ -377,20 +346,13 @@ async def interactive_chat(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Interactive CLI chat with web search tools (Harmony format)",
+        description="Interactive CLI chat with Harmony browser tools",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  # Basic usage (auto-detects model from scheduler)
   python scripts/chat.py --scheduler-url http://localhost:8780
-
-  # Specify model explicitly
-  python scripts/chat.py \\
-      --scheduler-url http://localhost:8780 \\
-      --model /checkpoint/maestro/models/gpt-oss-120b
-
-  # Verbose mode with higher temperature
-  python scripts/chat.py --verbose --temperature 0.9
+  python scripts/chat.py --scheduler-url http://localhost:8780 --verbose
+  python scripts/chat.py --max-tool-calls 10 --temperature 0.9
 
 Environment Variables:
   ELASTIC_SERVING_URL  Default scheduler URL
@@ -406,28 +368,37 @@ Environment Variables:
     )
     parser.add_argument("--model", type=str, default=None, help="Model name/path")
     parser.add_argument(
-        "--max-rounds", type=int, default=15,
-        help="Max tool-call rounds per user turn (default: 15)",
+        "--max-tool-calls",
+        type=int,
+        default=DEFAULT_MAX_TOOL_CALLS,
+        help=f"Max browser tool calls per user turn (default: {DEFAULT_MAX_TOOL_CALLS})",
     )
     parser.add_argument(
-        "--max-gen-tokens", type=int, default=8192,
+        "--max-gen-tokens",
+        type=int,
+        default=8192,
         help="Max tokens per generation (default: 8192)",
     )
     parser.add_argument(
-        "--temperature", type=float, default=0.7,
+        "--temperature",
+        type=float,
+        default=0.7,
         help="Sampling temperature (default: 0.7)",
     )
     parser.add_argument(
-        "--verbose", action="store_true",
+        "--verbose",
+        action="store_true",
         help="Show token counts and timing per round",
     )
     parser.add_argument(
-        "--system-prompt", type=str, default=None,
-        help="Override system prompt (or path to a .txt file)",
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="Override system prompt (string or path to a .txt file)",
     )
     args = parser.parse_args()
 
-    # Auto-detect model from scheduler
+    # Auto-detect model
     if not args.model:
         try:
             resp = httpx.get(
@@ -435,21 +406,19 @@ Environment Variables:
             )
             args.model = resp.json().get("model", "")
             if not args.model:
-                print("Error: Could not detect model from scheduler. Use --model.")
+                print("Error: Could not detect model. Use --model.")
                 sys.exit(1)
             print(f"Auto-detected model: {args.model}")
         except Exception as e:
-            print(f"Error connecting to scheduler at {args.scheduler_url}: {e}")
-            print("Make sure the scheduler is running, or specify --model explicitly.")
+            print(f"Error connecting to scheduler: {e}")
             sys.exit(1)
 
-    # Check scheduler health
+    # Health check
     try:
         resp = httpx.get(f"{args.scheduler_url.rstrip('/')}/health", timeout=5)
-        health = resp.json()
-        ready = health.get("ready_workers", 0)
+        ready = resp.json().get("ready_workers", 0)
         if ready == 0:
-            print(f"Warning: No ready workers yet. Chat may fail until workers are ready.")
+            print("Warning: No ready workers yet. Chat will wait for them.")
         else:
             print(f"Scheduler healthy: {ready} worker(s) ready.")
     except Exception:
@@ -458,6 +427,7 @@ Environment Variables:
     # Load tokenizer
     print(f"Loading tokenizer for {args.model}...")
     from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     print("Tokenizer loaded.")
 
@@ -475,7 +445,7 @@ Environment Variables:
             scheduler_url=args.scheduler_url,
             model=args.model,
             tokenizer=tokenizer,
-            max_rounds=args.max_rounds,
+            max_tool_calls=args.max_tool_calls,
             max_gen_tokens=args.max_gen_tokens,
             temperature=args.temperature,
             verbose=args.verbose,
@@ -486,4 +456,3 @@ Environment Variables:
 
 if __name__ == "__main__":
     main()
-

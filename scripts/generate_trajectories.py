@@ -34,7 +34,7 @@ dotenv.load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from elastic_serving.tools import (
-    SYSTEM_PROMPT,
+    LEGACY_SYSTEM_PROMPT as SYSTEM_PROMPT,
     TOOLS,
     execute_tool,
     parse_tool_call_from_raw,
