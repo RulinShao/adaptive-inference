@@ -128,7 +128,9 @@ def render(args):
                 pass
 
     n = len(trajs)
-    target = 2000
+    # Auto-detect target from trajectory indices
+    max_traj_idx = max((t.get("traj_idx", 0) for t in trajs), default=0) + 1
+    target = n_q * max_traj_idx if n_q > 0 else n
     qids = set(t["qid"] for t in trajs)
     n_q = len(qids)
 
@@ -172,7 +174,8 @@ def render(args):
     # Progress section
     print(f"  {BOLD}{WHITE}Eval Progress{RESET}")
     print(f"  {bar(n, target)} {BOLD}{n}{RESET}/{target} trajectories ({n/max(target,1)*100:.0f}%)")
-    print(f"  {bar(n_q, 500, fill_color=BLUE)} {BOLD}{n_q}{RESET}/500 questions")
+    target_q = target // max(max_traj_idx, 1)
+    print(f"  {bar(n_q, target_q, fill_color=BLUE)} {BOLD}{n_q}{RESET}/{target_q} questions")
     print()
     print(f"  {DIM}Avg time/traj:{RESET}  {BOLD}{avg_time:.0f}s{RESET}    "
           f"{DIM}Total GPU:{RESET} {BOLD}{total_time_h:.1f}h{RESET}    "
