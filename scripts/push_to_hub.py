@@ -29,11 +29,17 @@ def build_readme(results, rows, repo_id):
     correct = results.get("correct_trajectories", 0)
     avg_tools = results.get("avg_tool_calls", 0)
 
-    # Tool distribution from rows
+    # Tool distribution from rows (only valid tools, not hallucinated)
+    VALID_TOOLS = {
+        "browser.search", "browser.open", "browser.find",
+        "functions.paper_search", "functions.pubmed_search",
+    }
     tool_counts = Counter()
     for r in rows:
         for tc in json.loads(r.get("tool_calls", "[]")):
-            tool_counts[tc.get("tool", "")] += 1
+            tool = tc.get("tool", "")
+            if tool in VALID_TOOLS:
+                tool_counts[tool] += 1
     total_tools = sum(tool_counts.values())
 
     tool_table = ""
