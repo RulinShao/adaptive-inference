@@ -37,8 +37,8 @@ dotenv.load_dotenv()
 
 from elastic_serving.tools import (
     DEFAULT_MAX_TOOL_CALLS,
-    STOP_TOKENS,
-    STOP_TOKENS_NO_CALL,
+    STOP_TOKEN_IDS,
+    STOP_TOKEN_IDS_NO_CALL,
     SYSTEM_PROMPT,
     BrowserSession,
     append_tool_round,
@@ -133,7 +133,7 @@ async def chat_turn(
 
     while True:
         at_limit = tool_call_count >= max_tool_calls
-        stops = STOP_TOKENS_NO_CALL if at_limit else STOP_TOKENS
+        stop_ids = STOP_TOKEN_IDS_NO_CALL if at_limit else STOP_TOKEN_IDS
 
         if verbose:
             prompt_tokens = len(prompt) // 4  # rough estimate
@@ -156,7 +156,7 @@ async def chat_turn(
                         "prompt": prompt,
                         "max_tokens": max_gen_tokens,
                         "temperature": temperature,
-                        "stop": stops,
+                        "stop_token_ids": stop_ids,
                     },
                     headers={"Authorization": "Bearer EMPTY"},
                     timeout=300,

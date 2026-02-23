@@ -39,11 +39,44 @@ BUILTIN_TOOLS: List[str] = ["browser"]
 DEFAULT_MAX_TOOL_CALLS = 15
 """Default cap on tool calls per user turn."""
 
-STOP_TOKENS = ["<|call|>", "<|end|>", "<|endoftext|>"]
-"""vLLM stop strings for Harmony generation."""
+# Harmony special tokens are single tokens (e.g. <|call|> = 200012).
+# vLLM's `stop` (string matching) doesn't work because decode with
+# skip_special_tokens=True strips them.  Use `stop_token_ids` instead.
+#
+# Key insight: <|end|> appears after EVERY channel (analysis, commentary,
+# final), so it's NOT a valid stop token — the model generates multiple
+# <|end|> within a single turn.  Instead we stop at:
+#   <|call|>  (200012) — tool call boundary
+#   <|return|> (200002) — true EOS, generated after final answer
+STOP_TOKEN_IDS = [200012, 200002]  # <|call|>, <|return|>
+"""vLLM stop_token_ids for Harmony generation."""
 
-STOP_TOKENS_NO_CALL = ["<|end|>", "<|endoftext|>"]
-"""Stop strings that force a final answer (no more tool calls)."""
+STOP_TOKEN_IDS_NO_CALL = [200002]  # <|return|> only
+"""stop_token_ids that force a final answer (no more tool calls)."""
+
+# Keep string versions for reference / non-vLLM backends
+STOP_TOKENS = ["<|call|>", "<|return|>"]
+STOP_TOKENS_NO_CALL = ["<|return|>"]
+
+
+def get_stop_token_ids(tokenizer) -> list:
+    """Resolve stop token IDs from the tokenizer (portable)."""
+    ids = []
+    for t in ["<|call|>", "<|return|>"]:
+        encoded = tokenizer.encode(t, add_special_tokens=False)
+        if len(encoded) == 1:
+            ids.append(encoded[0])
+    return ids
+
+
+def get_stop_token_ids_no_call(tokenizer) -> list:
+    """Resolve stop token IDs without <|call|> (portable)."""
+    ids = []
+    for t in ["<|return|>"]:
+        encoded = tokenizer.encode(t, add_special_tokens=False)
+        if len(encoded) == 1:
+            ids.append(encoded[0])
+    return ids
 
 
 # =============================================================================
@@ -128,6 +161,11 @@ def parse_tool_call(text: str) -> Optional[Tuple[str, str, dict]]:
 
     Returns ``(namespace, tool_name, args_dict)`` or ``None``.
     Handles both ``to=browser.*`` and ``to=functions.*`` tool calls.
+
+    The model output may be in two forms:
+    1. With special tokens (raw): ``to=browser.search<|channel|>commentary json<|message|>{...}``
+    2. Decoded (skip_special_tokens=True): ``commentary to=browser.search json{...}``
+       or ``commentary to=browser.search code{...}``
     """
     m = re.search(r"to=(browser|functions)\.(\w+)", text)
     if not m:
@@ -135,16 +173,29 @@ def parse_tool_call(text: str) -> Optional[Tuple[str, str, dict]]:
 
     namespace = m.group(1)
     tool_name = m.group(2)
+    after = text[m.end():]
 
+    # Strategy 1: <|message|> present (special tokens in text)
     msg_match = re.search(
         r"<\|message\|>(.*?)(?:<\|call\|>|<\|end\|>|$)", text, re.DOTALL
     )
     if msg_match:
         args_str = msg_match.group(1).strip()
     else:
-        after = text[m.end():]
-        json_match = re.search(r"(?:json|code)\s*(\{.*?\})\s*$", after, re.DOTALL)
-        args_str = json_match.group(1) if json_match else after.strip()
+        # Strategy 2: decoded text — find JSON after json/code marker
+        # Match the LAST {...} block (handles nested braces)
+        json_match = re.search(
+            r"(?:json|code)\s*(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})", after, re.DOTALL
+        )
+        if json_match:
+            args_str = json_match.group(1)
+        else:
+            # Strategy 3: any {...} after the tool name
+            brace_match = re.search(r"(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})", after)
+            if brace_match:
+                args_str = brace_match.group(1)
+            else:
+                args_str = after.strip()
 
     # Unescape if JSON-string-wrapped
     if args_str.startswith('"') and args_str.endswith('"'):

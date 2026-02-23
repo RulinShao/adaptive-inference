@@ -39,8 +39,8 @@ dotenv.load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from elastic_serving.tools import (
-    STOP_TOKENS,
-    STOP_TOKENS_NO_CALL,
+    STOP_TOKEN_IDS,
+    STOP_TOKEN_IDS_NO_CALL,
     SYSTEM_PROMPT,
     BrowserSession,
     append_tool_round,
@@ -112,7 +112,7 @@ async def generate_trajectory(
 
     while True:
         at_limit = tool_call_count >= max_tool_calls
-        stops = STOP_TOKENS_NO_CALL if at_limit else STOP_TOKENS
+        stop_ids = STOP_TOKEN_IDS_NO_CALL if at_limit else STOP_TOKEN_IDS
 
         # Guard against context overflow
         prompt_len = len(tokenizer.encode(prompt))
@@ -137,7 +137,7 @@ async def generate_trajectory(
                     "prompt": prompt,
                     "max_tokens": max_gen_tokens_this_round,
                     "temperature": temperature,
-                    "stop": stops,
+                    "stop_token_ids": stop_ids,
                 },
                 headers={"Authorization": "Bearer EMPTY"},
                 timeout=600,
