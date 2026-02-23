@@ -251,9 +251,10 @@ class BrowserSession:
 # ---- paper_search (functions.* namespace, Semantic Scholar) ----
 # =============================================================================
 
-SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
-SEMANTIC_SCHOLAR_FIELDS = (
-    "title,abstract,authors,year,url,citationCount,externalIds"
+S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
+S2_PAPER_SEARCH_FIELDS = (
+    "paperId,title,abstract,authors,authors.name,year,url,"
+    "citationCount,externalIds,isOpenAccess,openAccessPdf,venue"
 )
 
 PAPER_SEARCH_TOOL = {
@@ -261,10 +262,11 @@ PAPER_SEARCH_TOOL = {
     "function": {
         "name": "paper_search",
         "description": (
-            "Search academic papers via Semantic Scholar. Returns paper "
-            "titles, abstracts, authors, publication year, and URLs. "
-            "Use this for scientific questions, research findings, "
-            "benchmarks, and peer-reviewed evidence."
+            "Search academic papers via Semantic Scholar. Two modes: "
+            "'papers' returns paper metadata (titles, abstracts, authors, "
+            "PDF links); 'snippets' returns relevant text passages from "
+            "within paper content (more useful for finding specific facts "
+            "and claims). Use 'snippets' by default."
         ),
         "parameters": {
             "type": "object",
@@ -273,11 +275,17 @@ PAPER_SEARCH_TOOL = {
                     "type": "string",
                     "description": "The search query for academic papers.",
                 },
+                "mode": {
+                    "type": "string",
+                    "description": (
+                        "Search mode: 'snippets' (default) returns text "
+                        "passages from paper content; 'papers' returns paper "
+                        "metadata with abstracts and PDF links."
+                    ),
+                },
                 "limit": {
                     "type": "number",
-                    "description": (
-                        "Maximum number of papers to return (default: 5)."
-                    ),
+                    "description": "Max results to return (default: 5).",
                 },
                 "year": {
                     "type": "string",
@@ -289,9 +297,15 @@ PAPER_SEARCH_TOOL = {
                 "fields_of_study": {
                     "type": "string",
                     "description": (
-                        "Comma-separated fields of study to filter by. "
-                        "Examples: 'Computer Science', 'Medicine', "
-                        "'Computer Science,Physics'."
+                        "Comma-separated fields of study. "
+                        "E.g. 'Computer Science', 'Medicine'."
+                    ),
+                },
+                "venue": {
+                    "type": "string",
+                    "description": (
+                        "Restrict to a venue (ISO4 abbreviation). "
+                        "E.g. 'ACL', 'NeurIPS', 'Nature'."
                     ),
                 },
             },
@@ -301,50 +315,67 @@ PAPER_SEARCH_TOOL = {
 }
 
 
-async def paper_search(
+def _s2_headers() -> Dict[str, str]:
+    api_key = os.getenv("S2_API_KEY", "")
+    return {"x-api-key": api_key} if api_key else {}
+
+
+def _make_pdf_url(paper: dict) -> Optional[str]:
+    """Construct open-access PDF URL from paper metadata."""
+    oap = paper.get("openAccessPdf")
+    if oap and oap.get("url"):
+        return oap["url"]
+    ext = paper.get("externalIds") or {}
+    if ext.get("ArXiv"):
+        return f"https://arxiv.org/pdf/{ext['ArXiv']}"
+    if ext.get("ACL"):
+        return f"https://www.aclweb.org/anthology/{ext['ACL']}.pdf"
+    return None
+
+
+async def _search_papers(
     query: str,
     http_client: httpx.AsyncClient,
     limit: int = 5,
     year: Optional[str] = None,
     fields_of_study: Optional[str] = None,
+    venue: Optional[str] = None,
 ) -> str:
-    """Search academic papers via Semantic Scholar API."""
+    """Paper metadata search via /paper/search."""
     params: Dict[str, Any] = {
         "query": query,
         "limit": min(limit, 20),
-        "fields": SEMANTIC_SCHOLAR_FIELDS,
+        "fields": S2_PAPER_SEARCH_FIELDS,
     }
     if year:
         params["year"] = year
     if fields_of_study:
         params["fieldsOfStudy"] = fields_of_study
-
-    api_key = os.getenv("S2_API_KEY", "")
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
+    if venue:
+        params["venue"] = venue
 
     try:
         resp = await http_client.get(
-            SEMANTIC_SCHOLAR_API,
+            f"{S2_API_BASE}/paper/search",
             params=params,
-            headers=headers,
+            headers=_s2_headers(),
             timeout=15,
         )
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        return f"Snippet search error: {e}"
+        return f"Paper search error: {e}"
 
     papers = data.get("data", [])
     if not papers:
-        return f"No academic papers found for: {query}"
+        return f"No papers found for: {query}"
 
-    lines = [f'Academic paper search: "{query}"', ""]
+    lines = [f'Paper search: "{query}"', ""]
     for i, p in enumerate(papers, 1):
         title = p.get("title", "Untitled")
         year_val = p.get("year", "")
         citations = p.get("citationCount", 0)
+        venue_val = p.get("venue", "")
         authors = p.get("authors", [])
         author_str = ", ".join(a.get("name", "") for a in authors[:4])
         if len(authors) > 4:
@@ -352,24 +383,151 @@ async def paper_search(
         abstract = p.get("abstract", "") or ""
         if len(abstract) > 500:
             abstract = abstract[:500] + "..."
-        url = p.get("url", "")
+        s2_url = p.get("url", "")
         ext = p.get("externalIds", {}) or {}
         doi = ext.get("DOI", "")
+        pdf_url = _make_pdf_url(p)
 
         lines.append(f"[{i}] {title}")
         if author_str:
             lines.append(f"    Authors: {author_str}")
+        meta = []
         if year_val:
-            lines.append(f"    Year: {year_val} | Citations: {citations}")
+            meta.append(f"Year: {year_val}")
+        if venue_val:
+            meta.append(f"Venue: {venue_val}")
+        meta.append(f"Citations: {citations}")
+        lines.append(f"    {' | '.join(meta)}")
         if doi:
             lines.append(f"    DOI: {doi}")
-        if url:
-            lines.append(f"    URL: {url}")
+        if pdf_url:
+            lines.append(f"    PDF: {pdf_url}")
+        if s2_url:
+            lines.append(f"    URL: {s2_url}")
         if abstract:
             lines.append(f"    Abstract: {abstract}")
         lines.append("")
 
     return "\n".join(lines)
+
+
+async def _search_snippets(
+    query: str,
+    http_client: httpx.AsyncClient,
+    limit: int = 10,
+    year: Optional[str] = None,
+    fields_of_study: Optional[str] = None,
+    venue: Optional[str] = None,
+) -> str:
+    """Snippet (passage) search via /snippet/search.
+
+    Returns actual text passages from within paper content, not just
+    abstracts.  Much more useful for finding specific facts and claims.
+    """
+    params: Dict[str, Any] = {
+        "query": query,
+        "limit": min(limit, 20),
+    }
+    if year:
+        params["year"] = year
+    if fields_of_study:
+        params["fieldsOfStudy"] = fields_of_study
+    if venue:
+        params["venue"] = venue
+
+    try:
+        resp = await http_client.get(
+            f"{S2_API_BASE}/snippet/search",
+            params=params,
+            headers=_s2_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return f"Snippet search error: {e}"
+
+    snippets = data.get("data", [])
+    if not snippets:
+        return f"No paper snippets found for: {query}"
+
+    lines = [f'Paper snippet search: "{query}"', ""]
+    for i, s in enumerate(snippets, 1):
+        # Extract snippet text — may be a string or a dict with "text" key
+        raw_snippet = s.get("snippet", s.get("text", ""))
+        if isinstance(raw_snippet, dict):
+            snippet_text = raw_snippet.get("text", "")
+            snippet_section = raw_snippet.get("section", "")
+        else:
+            snippet_text = raw_snippet
+            snippet_section = s.get("section", "")
+
+        paper = s.get("paper", {})
+        title = paper.get("title", s.get("title", ""))
+        authors = paper.get("authors", s.get("authors", []))
+        year_val = paper.get("year", s.get("year", ""))
+        paper_id = paper.get("paperId", s.get("paperId", ""))
+        venue_val = paper.get("venue", s.get("venue", ""))
+
+        author_str = ""
+        if authors:
+            author_str = ", ".join(
+                a.get("name", a) if isinstance(a, dict) else str(a)
+                for a in authors[:3]
+            )
+            if len(authors) > 3:
+                author_str += " et al."
+
+        lines.append(f"[{i}] {title}")
+        meta = []
+        if author_str:
+            meta.append(author_str)
+        if year_val:
+            meta.append(str(year_val))
+        if venue_val:
+            meta.append(venue_val)
+        if meta:
+            lines.append(f"    {' | '.join(meta)}")
+        if paper_id:
+            lines.append(
+                f"    URL: https://www.semanticscholar.org/paper/{paper_id}"
+            )
+        if snippet_section:
+            lines.append(f"    Section: {snippet_section}")
+        if snippet_text:
+            # Truncate very long snippets
+            if len(snippet_text) > 800:
+                snippet_text = snippet_text[:800] + "..."
+            lines.append(f"    Snippet: {snippet_text}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+async def paper_search(
+    query: str,
+    http_client: httpx.AsyncClient,
+    mode: str = "snippets",
+    limit: int = 5,
+    year: Optional[str] = None,
+    fields_of_study: Optional[str] = None,
+    venue: Optional[str] = None,
+) -> str:
+    """Search academic papers via Semantic Scholar.
+
+    mode='snippets' — returns text passages from paper content (default).
+    mode='papers'   — returns paper metadata (titles, abstracts, PDF links).
+    """
+    if mode == "papers":
+        return await _search_papers(
+            query, http_client, limit=limit, year=year,
+            fields_of_study=fields_of_study, venue=venue,
+        )
+    else:
+        return await _search_snippets(
+            query, http_client, limit=limit, year=year,
+            fields_of_study=fields_of_study, venue=venue,
+        )
 
 
 # =============================================================================
@@ -388,9 +546,11 @@ async def execute_custom_tool(
         return await paper_search(
             query=args.get("query", ""),
             http_client=http_client,
+            mode=args.get("mode", "snippets"),
             limit=int(args.get("limit", 5)),
             year=args.get("year"),
             fields_of_study=args.get("fields_of_study"),
+            venue=args.get("venue"),
         )
     return f"Unknown custom tool: {name}"
 

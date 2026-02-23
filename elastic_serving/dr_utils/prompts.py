@@ -7,7 +7,7 @@ rendered separately by the template from the tool specs.
 """
 
 # =============================================================================
-# Model identity (replaces "You are ChatGPT..." in the system message)
+# Model identity (replaces "You are DR Tulu..." in the system message)
 # =============================================================================
 
 MODEL_IDENTITY = (
