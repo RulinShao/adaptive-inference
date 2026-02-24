@@ -208,9 +208,12 @@ async def run_eval(args):
     import datasets
     from transformers import AutoTokenizer
 
-    # Load dataset
+    # Load dataset — support HF hub or local JSONL
     print(f"Loading dataset: {args.dataset} split={args.split}")
-    ds = datasets.load_dataset(args.dataset, split=args.split)
+    if args.dataset.endswith(".jsonl") or args.dataset.endswith(".json"):
+        ds = datasets.load_dataset("json", data_files=args.dataset, split="train")
+    else:
+        ds = datasets.load_dataset(args.dataset, split=args.split)
     print(f"Dataset: {len(ds)} rows, columns: {ds.column_names}")
 
     if args.num_samples > 0:
