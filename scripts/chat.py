@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+from typing import Optional
 
 import dotenv
 import httpx
@@ -41,6 +42,7 @@ from elastic_serving.tools import (
     STOP_TOKENS_NO_CALL,
     SYSTEM_PROMPT,
     BrowserSession,
+    PythonSession,
     append_tool_round,
     append_user_turn,
     build_initial_prompt,
@@ -116,6 +118,7 @@ async def chat_turn(
     base_url: str,
     model: str,
     browser: BrowserSession,
+    python_session: Optional["PythonSession"] = None,
     http_client: httpx.AsyncClient,
     openai_http: httpx.AsyncClient,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
@@ -211,9 +214,14 @@ async def chat_turn(
             tool_call_count += 1
             print_tool_call(ns, tool_name, tool_args)
 
-            # Execute — browser.* or functions.*
-            if ns == "browser":
+            # Execute — browser.*, python, or functions.*
+            if ns == "python" and python_session:
+                code = tool_args.get("code", "")
+                result = python_session.execute(code)
+            elif ns == "browser":
                 result = await browser.execute(tool_name, tool_args)
+            elif ns == "python" and not python_session:
+                result = "Error: Python tool not enabled. Pass --enable-python to enable."
             else:
                 result = await execute_custom_tool(
                     tool_name, tool_args, http_client
@@ -254,6 +262,9 @@ async def interactive_chat(
     http_client = httpx.AsyncClient(timeout=60)
     openai_http = httpx.AsyncClient(timeout=300)
     browser = BrowserSession(http_client)
+    python_session = PythonSession(timeout=120, allowed_dirs=["/tmp/python_sandbox"]) if args.enable_python else None
+    if python_session:
+        cprint("  Python tool enabled (Jupyter kernel)", C.GREEN)
 
     base_url = scheduler_url.rstrip("/")
 
@@ -315,6 +326,7 @@ async def interactive_chat(
                 tokenizer,
                 user_message=user_input,
                 system_prompt=system_prompt,
+                enable_python=args.enable_python,
             )
         else:
             # Subsequent turns: extend the raw prompt directly
@@ -331,6 +343,7 @@ async def interactive_chat(
             base_url=base_url,
             model=model,
             browser=browser,
+            python_session=python_session,
             http_client=http_client,
             openai_http=openai_http,
             max_tool_calls=max_tool_calls,
@@ -404,6 +417,11 @@ Environment Variables:
         type=str,
         default=None,
         help="Override system prompt (string or path to a .txt file)",
+    )
+    parser.add_argument(
+        "--enable-python",
+        action="store_true",
+        help="Enable python code execution tool (requires jupyter_client + ipykernel)",
     )
     args = parser.parse_args()
 

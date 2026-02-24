@@ -25,6 +25,7 @@ from elastic_serving.dr_utils import (  # noqa: F401
     PAPER_SEARCH_TOOL,
     SYSTEM_PROMPT,
     BrowserSession,
+    PythonSession,
     execute_custom_tool,
     paper_search,
 )
@@ -34,7 +35,13 @@ from elastic_serving.dr_utils import (  # noqa: F401
 # =============================================================================
 
 BUILTIN_TOOLS: List[str] = ["browser"]
-"""Passed to ``apply_chat_template(builtin_tools=...)``."""
+"""Passed to ``apply_chat_template(builtin_tools=...)``.
+
+Use ``BUILTIN_TOOLS_WITH_PYTHON`` to enable the python code tool.
+"""
+
+BUILTIN_TOOLS_WITH_PYTHON: List[str] = ["browser", "python"]
+"""Builtin tools including the python code execution tool."""
 
 DEFAULT_MAX_TOOL_CALLS = 15
 """Default cap on tool calls per user turn."""
@@ -71,11 +78,13 @@ def build_initial_prompt(
     model_identity: str = MODEL_IDENTITY,
     custom_tools: Optional[List[dict]] = None,
     history: Optional[List[Dict[str, str]]] = None,
+    enable_python: bool = False,
 ) -> str:
     """Build the initial prompt using ``apply_chat_template``.
 
-    Uses ``builtin_tools=["browser"]`` so the model sees its native browser
-    namespace.  ``system_prompt`` goes into the developer message.
+    Uses ``builtin_tools=["browser"]`` (or ``["browser", "python"]`` if
+    *enable_python* is True) so the model sees its native tool namespaces.
+    ``system_prompt`` goes into the developer message.
     Custom tools (e.g. paper_search) go into the ``functions`` namespace.
     """
     messages: List[Dict[str, str]] = []
@@ -84,8 +93,9 @@ def build_initial_prompt(
         messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
+    builtin = BUILTIN_TOOLS_WITH_PYTHON if enable_python else BUILTIN_TOOLS
     kwargs = {
-        "builtin_tools": BUILTIN_TOOLS,
+        "builtin_tools": builtin,
         "model_identity": model_identity,
         "tokenize": False,
         "add_generation_prompt": True,
@@ -108,8 +118,20 @@ def append_tool_round(
 
     ``model_output`` is the raw text from vLLM (does NOT include the
     ``<|call|>`` stop token).  ``namespace`` is ``"browser"`` for built-in
-    tools or ``"functions"`` for custom tools.
+    tools, ``"python"`` for the python code tool, or ``"functions"`` for
+    custom tools.
     """
+    if namespace == "python":
+        # Python builtin: bare "python to=assistant" (no dot/function)
+        return (
+            f"{prompt}{model_output}"
+            f"<|call|>"
+            f"<|start|>python to=assistant"
+            f"<|channel|>commentary<|message|>"
+            f"{tool_response}"
+            f"<|end|>"
+            f"<|start|>assistant"
+        )
     return (
         f"{prompt}{model_output}"
         f"<|call|>"
@@ -140,13 +162,33 @@ def parse_tool_call(text: str) -> Optional[Tuple[str, str, dict]]:
     """Parse a tool call from raw model output.
 
     Returns ``(namespace, tool_name, args_dict)`` or ``None``.
-    Handles both ``to=browser.*`` and ``to=functions.*`` tool calls.
+    Handles:
+      - ``to=browser.search`` / ``to=browser.open`` / ``to=browser.find``
+      - ``to=functions.paper_search`` / ``to=functions.pubmed_search``
+      - ``to=python`` (bare name, raw code — not JSON)
 
     The model output may be in two forms:
-    1. With special tokens (raw): ``to=browser.search<|channel|>commentary json<|message|>{...}``
-    2. Decoded (skip_special_tokens=True): ``commentary to=browser.search json{...}``
-       or ``commentary to=browser.search code{...}``
+    1. With special tokens (raw): ``to=browser.search ... <|message|>{...}``
+    2. Decoded (skip_special_tokens=True): ``commentary to=browser.search code{...}``
     """
+    # ---- Special case: python tool (bare name, raw code) ----
+    py_match = re.search(r"to=python\b", text)
+    if py_match:
+        after_py = text[py_match.end():]
+        # Extract code from <|message|>...<|call|> or <|message|>...$ 
+        msg_match = re.search(
+            r"<\|message\|>(.*?)(?:<\|call\|>|<\|end\|>|$)", after_py, re.DOTALL
+        )
+        if msg_match:
+            code = msg_match.group(1).strip()
+        else:
+            # Decoded text: skip "code" marker then take rest
+            code_match = re.search(r"(?:code)\s*(.*)", after_py, re.DOTALL)
+            code = code_match.group(1).strip() if code_match else after_py.strip()
+        if code:
+            return "python", "execute", {"code": code}
+
+    # ---- browser.* and functions.* tools ----
     m = re.search(r"to=(browser|functions)\.(\w+)", text)
     if not m:
         return None

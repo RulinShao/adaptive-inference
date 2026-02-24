@@ -11,6 +11,7 @@ from elastic_serving.dr_utils.tools import (
     PAPER_SEARCH_TOOL,
     PUBMED_SEARCH_TOOL,
     BrowserSession,
+    PythonSession,
     execute_custom_tool,
     paper_search,
     pubmed_search,
@@ -29,6 +30,7 @@ __all__ = [
     "PAPER_SEARCH_TOOL",
     # Tool implementations
     "BrowserSession",
+    "PythonSession",
     "paper_search",
     "execute_custom_tool",
 ]

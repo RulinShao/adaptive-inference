@@ -5,8 +5,9 @@ Each tool class/function:
   1. Defines an OpenAI-compatible tool spec (for ``apply_chat_template``).
   2. Implements the actual API call (Serper, Jina, Semantic Scholar, etc.).
 
-Tools are split into two Harmony namespaces:
+Tools are split into Harmony namespaces:
   ``browser.*``    — built-in (Serper search + Jina reader + local find)
+  ``python``       — built-in (stateful Jupyter code execution)
   ``functions.*``  — custom (paper_search via Semantic Scholar)
 
 To add a new tool:
@@ -16,6 +17,9 @@ To add a new tool:
 """
 
 import os
+import queue
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -700,6 +704,131 @@ async def pubmed_search(
         lines.append("")
 
     return "\n".join(lines)
+
+
+# =============================================================================
+# ---- Python code execution (Jupyter kernel) ----
+# =============================================================================
+
+# Pre-import setup run in every new kernel
+_PYTHON_SANDBOX_SETUP = """\
+import os, sys, math, json, re, collections, itertools, functools, statistics
+try:
+    import numpy as np
+except ImportError:
+    pass
+try:
+    import pandas as pd
+except ImportError:
+    pass
+try:
+    import sympy
+except ImportError:
+    pass
+"""
+
+MAX_PYTHON_OUTPUT = 30_000  # truncate output to this many chars
+
+
+class PythonSession:
+    """Stateful Jupyter kernel for code execution.
+
+    Matches gpt-oss's native ``python`` builtin tool: a persistent Jupyter
+    notebook environment with 120s timeout.
+
+    Each call to :meth:`execute` runs code in the same kernel, so variables
+    persist across calls (stateful, like ChatGPT's Code Interpreter).
+
+    Parameters
+    ----------
+    timeout : int
+        Max seconds per code execution (default 120, matching model prompt).
+    allowed_dirs : list[str] | None
+        If set, ``os.chdir`` is called to the first dir and a warning is
+        printed for filesystem access outside these directories.
+    """
+
+    def __init__(
+        self,
+        timeout: int = 120,
+        allowed_dirs: Optional[List[str]] = None,
+    ):
+        from jupyter_client import KernelManager
+
+        self.km = KernelManager(kernel_name="python3")
+        self.km.start_kernel()
+        self.kc = self.km.client()
+        self.kc.start_channels()
+        self.kc.wait_for_ready(timeout=30)
+        self.timeout = timeout
+
+        # Sandbox init: pre-import packages + set working dir
+        setup = _PYTHON_SANDBOX_SETUP
+        if allowed_dirs:
+            first_dir = allowed_dirs[0]
+            setup += f"\nos.makedirs({first_dir!r}, exist_ok=True)\nos.chdir({first_dir!r})\n"
+        self.execute(setup)
+
+    def execute(self, code: str) -> str:
+        """Execute *code* in the kernel and return combined output.
+
+        Returns stdout, display results, and error tracebacks concatenated.
+        Output is truncated to ``MAX_PYTHON_OUTPUT`` characters.
+        """
+        msg_id = self.kc.execute(code)
+        outputs: List[str] = []
+        deadline = time.time() + self.timeout
+
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                outputs.append(f"\n[Execution timed out after {self.timeout}s]")
+                break
+            try:
+                msg = self.kc.get_iopub_msg(timeout=remaining)
+            except queue.Empty:
+                outputs.append(f"\n[Execution timed out after {self.timeout}s]")
+                break
+
+            if msg["parent_header"].get("msg_id") != msg_id:
+                continue
+
+            msg_type = msg["msg_type"]
+            content = msg["content"]
+
+            if msg_type == "stream":
+                outputs.append(content["text"])
+            elif msg_type in ("execute_result", "display_data"):
+                text = content.get("data", {}).get("text/plain", "")
+                if text:
+                    outputs.append(text)
+            elif msg_type == "error":
+                # Strip ANSI escape codes from traceback
+                import re as _re
+                tb = "\n".join(content.get("traceback", []))
+                tb = _re.sub(r"\x1b\[[0-9;]*m", "", tb)
+                outputs.append(tb)
+            elif (
+                msg_type == "status"
+                and content.get("execution_state") == "idle"
+            ):
+                break
+
+        result = "\n".join(outputs).strip()
+        if len(result) > MAX_PYTHON_OUTPUT:
+            result = result[:MAX_PYTHON_OUTPUT] + f"\n... [output truncated at {MAX_PYTHON_OUTPUT} chars]"
+        return result if result else "(no output)"
+
+    def close(self):
+        """Shut down the kernel and release resources."""
+        try:
+            self.kc.stop_channels()
+        except Exception:
+            pass
+        try:
+            self.km.shutdown_kernel(now=True)
+        except Exception:
+            pass
 
 
 # =============================================================================

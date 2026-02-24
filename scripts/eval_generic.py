@@ -33,6 +33,7 @@ from elastic_serving.tools import (
     STOP_TOKENS_NO_CALL,
     SYSTEM_PROMPT,
     BrowserSession,
+    PythonSession,
     append_tool_round,
     build_initial_prompt,
     execute_custom_tool,
@@ -68,15 +69,17 @@ async def generate_trajectory(
     traj_idx=0, max_tool_calls=MAX_TOOL_CALLS,
     max_gen_tokens=MAX_GEN_TOKENS, temperature=TEMPERATURE,
     save_conversation=False, api_sem=None, blocked_domains=None,
+    enable_python=False,
 ):
     http_client = httpx.AsyncClient(timeout=60)
     openai_http = httpx.AsyncClient(timeout=600)
     browser = BrowserSession(http_client, blocked_domains=blocked_domains)
+    python_session = PythonSession(timeout=120, allowed_dirs=["/tmp/python_sandbox"]) if enable_python else None
     tool_call_count = 0
     tool_calls_log = []
     conversation = [] if save_conversation else None
 
-    prompt = build_initial_prompt(tokenizer, user_message=question)
+    prompt = build_initial_prompt(tokenizer, user_message=question, enable_python=enable_python)
     tag = f"qid={qid} t={traj_idx}"
     t0 = time.time()
 
@@ -123,13 +126,23 @@ async def generate_trajectory(
             short = json.dumps(tool_args, ensure_ascii=False)[:80]
             print(f"  [{tag}] Tool {tool_call_count}/{max_tool_calls}: {ns}.{tool_name}({short})")
 
-            if api_sem:
+            if ns == "python" and python_session:
+                # Python tool: synchronous kernel execution (no API semaphore needed)
+                code = tool_args.get("code", "")
+                result = python_session.execute(code)
+            elif api_sem:
                 async with api_sem:
-                    result = await browser.execute(tool_name, tool_args) if ns == "browser" else \
-                             await execute_custom_tool(tool_name, tool_args, http_client)
+                    if ns == "browser":
+                        result = await browser.execute(tool_name, tool_args)
+                    else:
+                        result = await execute_custom_tool(tool_name, tool_args, http_client)
             else:
-                result = await browser.execute(tool_name, tool_args) if ns == "browser" else \
-                         await execute_custom_tool(tool_name, tool_args, http_client)
+                if ns == "browser":
+                    result = await browser.execute(tool_name, tool_args)
+                elif ns == "python" and not python_session:
+                    result = "Error: Python tool not enabled. Pass --enable-python to enable."
+                else:
+                    result = await execute_custom_tool(tool_name, tool_args, http_client)
 
             tool_calls_log.append({
                 "round": tool_call_count, "tool": f"{ns}.{tool_name}",
@@ -161,6 +174,8 @@ async def generate_trajectory(
             print(f"  [{tag}] Done: {tool_call_count} tools, {elapsed:.1f}s, answer={boxed_answer or answer[:80]}")
             await http_client.aclose()
             await openai_http.aclose()
+            if python_session:
+                python_session.close()
             return {
                 "qid": qid, "traj_idx": traj_idx, "question": question,
                 "answer": answer, "boxed_answer": boxed_answer,
@@ -170,6 +185,8 @@ async def generate_trajectory(
 
     await http_client.aclose()
     await openai_http.aclose()
+    if python_session:
+        python_session.close()
     return {
         "qid": qid, "traj_idx": traj_idx, "question": question,
         "answer": "", "boxed_answer": "", "num_tool_calls": tool_call_count,
@@ -293,6 +310,7 @@ async def run_eval(args):
                     max_tool_calls=args.max_tool_calls, temperature=args.temperature,
                     save_conversation=args.save_full_trajectories,
                     api_sem=api_sem, blocked_domains=args.blocked_domains,
+                    enable_python=args.enable_python,
                 )
                 result["reference_answer"] = row.get(a_col, "")
             except Exception:
@@ -404,6 +422,8 @@ def main():
     p.add_argument("--judge-model", default=JUDGE_MODEL)
     p.add_argument("--save-full-trajectories", action="store_true")
     p.add_argument("--blocked-domains", nargs="*", default=None)
+    p.add_argument("--enable-python", action="store_true",
+                    help="Enable python code execution tool (requires jupyter_client + ipykernel)")
     args = p.parse_args()
 
     if not args.model:
