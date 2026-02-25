@@ -217,7 +217,7 @@ async def chat_turn(
             # Execute — browser.*, python, or functions.*
             if ns == "python" and python_session:
                 code = tool_args.get("code", "")
-                result = python_session.execute(code)
+                result = await asyncio.to_thread(python_session.execute, code)
             elif ns == "browser":
                 result = await browser.execute(tool_name, tool_args)
             elif ns == "python" and not python_session:

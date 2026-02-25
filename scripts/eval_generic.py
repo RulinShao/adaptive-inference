@@ -127,9 +127,9 @@ async def generate_trajectory(
             print(f"  [{tag}] Tool {tool_call_count}/{max_tool_calls}: {ns}.{tool_name}({short})")
 
             if ns == "python" and python_session:
-                # Python tool: synchronous kernel execution (no API semaphore needed)
+                # Python tool: run in thread to avoid blocking the async event loop
                 code = tool_args.get("code", "")
-                result = python_session.execute(code)
+                result = await asyncio.to_thread(python_session.execute, code)
             elif api_sem:
                 async with api_sem:
                     if ns == "browser":
