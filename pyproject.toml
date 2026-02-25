@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 papers = [
-    "agent-papers-cli",
+    "agent-papers-cli @ git+https://github.com/collaborative-deep-research/agent-papers-cli.git",
 ]
 client = [
     "openai>=1.0.0",

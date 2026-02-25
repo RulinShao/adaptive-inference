@@ -34,14 +34,20 @@ Academic search tools (functions.* namespace):
   - scholar_search — search Google Scholar
   - paper_details — look up a specific paper by ID (S2 ID, DOI, ArXiv ID)
   - paper_citations — get papers citing a paper, or papers it references
-  - read_paper — fetch and read an arxiv paper's full text by section
+  - read_paper — fetch and read an arxiv paper with multiple modes:
+      mode='outline' — table of contents + abstract (default, start here)
+      mode='skim' — headings + first N sentences per section (quick overview)
+      mode='read' + section=<name> — full text of a specific section
+      mode='search' + query=<text> — search for keywords within the paper
+      mode='goto' + ref_id=<ref> — jump to a reference (s3=section, e1=link, c5=citation)
 
 Workflow tips:
   - Use paper_search or scholar_search to find relevant papers
   - Use paper_details to get full metadata for a specific paper
   - Use paper_citations to explore the citation graph (find related work)
-  - Use read_paper to read the actual content of arxiv papers section by section
-  - Use read_paper without a section argument first to see the table of contents
+  - To read a paper: start with read_paper mode='outline' to see structure,
+    then mode='skim' for a quick overview, then mode='read' for specific sections
+  - Use mode='goto' to follow references shown in outline/skim output
 
 Support every non-trivial claim with evidence from your searches. Cite \
 information using the cursor citation format (e.g. 【3†L15-L20】). If \
