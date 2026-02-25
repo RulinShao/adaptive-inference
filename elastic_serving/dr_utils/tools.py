@@ -14,8 +14,15 @@ To add a new tool:
   1. Define its spec dict (same schema as OpenAI function calling).
   2. Add an ``async def`` implementation.
   3. Register it in ``CUSTOM_TOOLS`` and ``execute_custom_tool``.
+
+Several tools wrap functions from agent-papers-cli via ``asyncio.to_thread``:
+  ``paper_details``    — single paper lookup (S2 ID / DOI / ArXiv)
+  ``paper_citations``  — citation graph navigation
+  ``read_paper``       — fetch & parse arxiv PDFs into sections
+  ``scholar_search``   — Google Scholar via Serper
 """
 
+import asyncio
 import os
 import queue
 import threading
@@ -832,10 +839,378 @@ class PythonSession:
 
 
 # =============================================================================
+# ---- paper_details (functions.* namespace, Semantic Scholar) ----
+# =============================================================================
+
+PAPER_DETAILS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "paper_details",
+        "description": (
+            "Get details for a specific paper by Semantic Scholar paper ID, "
+            "DOI (prefix with 'DOI:'), or ArXiv ID (prefix with 'ArXiv:'). "
+            "Returns title, authors, year, venue, citation count, abstract, "
+            "and PDF link."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paper_id": {
+                    "type": "string",
+                    "description": (
+                        "Paper identifier. Examples: a Semantic Scholar ID, "
+                        "'DOI:10.18653/v1/2023.acl-long.1', "
+                        "'ArXiv:2301.12345', or a Semantic Scholar URL."
+                    ),
+                },
+            },
+            "required": ["paper_id"],
+        },
+    },
+}
+
+
+async def paper_details(paper_id: str) -> str:
+    """Look up a single paper by ID using agent-papers-cli."""
+    try:
+        from search.api import get_paper_details as _get_paper_details
+    except ImportError:
+        return (
+            "Error: agent-papers-cli is not installed. "
+            "Install it with: pip install -e ../agent-papers-cli"
+        )
+
+    try:
+        result = await asyncio.to_thread(_get_paper_details, paper_id)
+    except Exception as e:
+        return f"Paper details error: {e}"
+
+    lines = [f"Paper: {result.title}"]
+    if result.authors:
+        lines.append(f"Authors: {result.authors}")
+    meta = []
+    if result.year:
+        meta.append(f"Year: {result.year}")
+    if result.venue:
+        meta.append(f"Venue: {result.venue}")
+    if result.citation_count is not None:
+        meta.append(f"Citations: {result.citation_count}")
+    if meta:
+        lines.append(" | ".join(meta))
+    if result.arxiv_id:
+        lines.append(f"ArXiv: {result.arxiv_id}")
+    if result.url:
+        lines.append(f"URL: {result.url}")
+    if result.snippet:
+        lines.append(f"Abstract: {result.snippet}")
+    return "\n".join(lines)
+
+
+# =============================================================================
+# ---- paper_citations (functions.* namespace, Semantic Scholar) ----
+# =============================================================================
+
+PAPER_CITATIONS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "paper_citations",
+        "description": (
+            "Get the citation graph for a paper. 'citations' returns papers "
+            "that cite this paper; 'references' returns papers this paper "
+            "cites. Useful for literature review and finding related work."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paper_id": {
+                    "type": "string",
+                    "description": (
+                        "Semantic Scholar paper ID, DOI, or ArXiv ID."
+                    ),
+                },
+                "direction": {
+                    "type": "string",
+                    "description": (
+                        "'citations' (papers citing this one, default) "
+                        "or 'references' (papers this one cites)."
+                    ),
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Max results to return (default: 10).",
+                },
+            },
+            "required": ["paper_id"],
+        },
+    },
+}
+
+
+async def paper_citations(
+    paper_id: str,
+    direction: str = "citations",
+    limit: int = 10,
+) -> str:
+    """Get citations or references for a paper using agent-papers-cli."""
+    try:
+        from search.api import get_citations, get_references
+    except ImportError:
+        return (
+            "Error: agent-papers-cli is not installed. "
+            "Install it with: pip install -e ../agent-papers-cli"
+        )
+
+    try:
+        if direction == "references":
+            results = await asyncio.to_thread(
+                get_references, paper_id, limit=limit
+            )
+            header = f"References (papers cited by {paper_id})"
+        else:
+            results = await asyncio.to_thread(
+                get_citations, paper_id, limit=limit
+            )
+            header = f"Citations (papers citing {paper_id})"
+    except Exception as e:
+        return f"Citation lookup error: {e}"
+
+    if not results:
+        return f"No {direction} found for paper: {paper_id}"
+
+    lines = [header, ""]
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r.title}")
+        meta = []
+        if r.authors:
+            meta.append(r.authors)
+        if r.year:
+            meta.append(str(r.year))
+        if r.venue:
+            meta.append(r.venue)
+        if meta:
+            lines.append(f"    {' | '.join(meta)}")
+        if r.is_influential:
+            lines.append("    ** Influential citation **")
+        if r.paper_id:
+            lines.append(
+                f"    URL: https://www.semanticscholar.org/paper/{r.paper_id}"
+            )
+        if r.contexts:
+            for ctx in r.contexts[:2]:
+                lines.append(f"    Context: {ctx[:300]}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# ---- read_paper (functions.* namespace, arxiv PDF fetch + parse) ----
+# =============================================================================
+
+READ_PAPER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_paper",
+        "description": (
+            "Fetch and read an arxiv paper. Downloads the PDF, parses it "
+            "into structured sections, and returns the content. Without a "
+            "section argument, returns the table of contents and abstract. "
+            "With a section name, returns that section's full text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "arxiv_id": {
+                    "type": "string",
+                    "description": (
+                        "ArXiv ID (e.g. '2301.12345') or full URL "
+                        "(e.g. 'https://arxiv.org/abs/2301.12345')."
+                    ),
+                },
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "Section to read (e.g. 'Introduction', 'Method', "
+                        "'Results'). Case-insensitive substring match. "
+                        "If omitted, returns table of contents + abstract."
+                    ),
+                },
+            },
+            "required": ["arxiv_id"],
+        },
+    },
+}
+
+
+def _fetch_and_parse(arxiv_id: str):
+    """Synchronous helper: fetch PDF + parse into Document."""
+    from paper.api import fetch_paper, parse_paper
+
+    paper_id, pdf_path = fetch_paper(arxiv_id)
+    doc = parse_paper(paper_id, pdf_path)
+    return doc
+
+
+async def read_paper(
+    arxiv_id: str,
+    section: Optional[str] = None,
+) -> str:
+    """Fetch an arxiv paper and return its content using agent-papers-cli."""
+    try:
+        from paper.api import fetch_paper, parse_paper  # noqa: F401
+    except ImportError:
+        return (
+            "Error: agent-papers-cli is not installed. "
+            "Install it with: pip install -e ../agent-papers-cli"
+        )
+
+    try:
+        doc = await asyncio.to_thread(_fetch_and_parse, arxiv_id)
+    except Exception as e:
+        return f"Error reading paper: {e}"
+
+    if section:
+        # Find matching section (case-insensitive substring)
+        section_lower = section.lower()
+        matched = [
+            s for s in doc.sections
+            if section_lower in s.heading.lower()
+        ]
+        if not matched:
+            headings = [s.heading for s in doc.sections]
+            return (
+                f"Section '{section}' not found. "
+                f"Available sections: {', '.join(headings)}"
+            )
+        lines = []
+        for s in matched:
+            lines.append(f"## {s.heading}")
+            lines.append("")
+            content = s.content
+            if len(content) > 8000:
+                content = content[:8000] + "\n... [truncated]"
+            lines.append(content)
+            lines.append("")
+        return "\n".join(lines)
+    else:
+        # Return ToC + abstract
+        lines = []
+        if doc.metadata.title:
+            lines.append(f"# {doc.metadata.title}")
+        if doc.metadata.authors:
+            lines.append(f"Authors: {', '.join(doc.metadata.authors)}")
+        if doc.metadata.url:
+            lines.append(f"URL: {doc.metadata.url}")
+        lines.append("")
+        lines.append("## Sections")
+        for i, s in enumerate(doc.sections, 1):
+            indent = "  " * (s.level - 1)
+            lines.append(f"{indent}{i}. {s.heading}")
+        lines.append("")
+
+        # Find abstract section
+        abstract_sections = [
+            s for s in doc.sections
+            if "abstract" in s.heading.lower()
+        ]
+        if abstract_sections:
+            lines.append("## Abstract")
+            abstract_text = abstract_sections[0].content
+            if len(abstract_text) > 2000:
+                abstract_text = abstract_text[:2000] + "..."
+            lines.append(abstract_text)
+        elif doc.metadata.abstract:
+            lines.append("## Abstract")
+            lines.append(doc.metadata.abstract)
+
+        return "\n".join(lines)
+
+
+# =============================================================================
+# ---- scholar_search (functions.* namespace, Google Scholar via Serper) ----
+# =============================================================================
+
+SCHOLAR_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "scholar_search",
+        "description": (
+            "Search Google Scholar for academic papers. Returns titles, "
+            "authors, publication info, year, citation counts, and snippets. "
+            "Useful as a complement to paper_search (Semantic Scholar) for "
+            "broader coverage."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query for Google Scholar.",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Max results to return (default: 10).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+async def scholar_search(query: str, limit: int = 10) -> str:
+    """Search Google Scholar using agent-papers-cli."""
+    try:
+        from search.api import search_scholar as _search_scholar
+    except ImportError:
+        return (
+            "Error: agent-papers-cli is not installed. "
+            "Install it with: pip install -e ../agent-papers-cli"
+        )
+
+    try:
+        results = await asyncio.to_thread(
+            _search_scholar, query, num_results=limit
+        )
+    except Exception as e:
+        return f"Scholar search error: {e}"
+
+    if not results:
+        return f"No Google Scholar results for: {query}"
+
+    lines = [f'Google Scholar: "{query}"', ""]
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r.title}")
+        meta = []
+        if r.authors:
+            meta.append(r.authors)
+        if r.year:
+            meta.append(str(r.year))
+        if r.citation_count is not None:
+            meta.append(f"Cited by {r.citation_count}")
+        if meta:
+            lines.append(f"    {' | '.join(meta)}")
+        if r.url:
+            lines.append(f"    URL: {r.url}")
+        if r.snippet:
+            lines.append(f"    {r.snippet}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
 # ---- Custom tool registry ----
 # =============================================================================
 
-CUSTOM_TOOLS = [PAPER_SEARCH_TOOL, PUBMED_SEARCH_TOOL]
+CUSTOM_TOOLS = [
+    PAPER_SEARCH_TOOL,
+    PUBMED_SEARCH_TOOL,
+    PAPER_DETAILS_TOOL,
+    PAPER_CITATIONS_TOOL,
+    READ_PAPER_TOOL,
+    SCHOLAR_SEARCH_TOOL,
+]
 """All custom tool specs — passed to ``apply_chat_template(tools=...)``."""
 
 
@@ -859,11 +1234,32 @@ async def execute_custom_tool(
             http_client=http_client,
             limit=int(args.get("limit", 5)),
         )
+    elif name == "paper_details":
+        return await paper_details(
+            paper_id=args.get("paper_id", ""),
+        )
+    elif name == "paper_citations":
+        return await paper_citations(
+            paper_id=args.get("paper_id", ""),
+            direction=args.get("direction", "citations"),
+            limit=int(args.get("limit", 10)),
+        )
+    elif name == "read_paper":
+        return await read_paper(
+            arxiv_id=args.get("arxiv_id", ""),
+            section=args.get("section"),
+        )
+    elif name == "scholar_search":
+        return await scholar_search(
+            query=args.get("query", ""),
+            limit=int(args.get("limit", 10)),
+        )
     # Model sometimes confuses namespaces (e.g. functions.browser instead
     # of browser.search).  Return a helpful nudge rather than a hard error.
     return (
         f"Unknown tool: functions.{name}. "
-        f"Available: paper_search, pubmed_search. "
+        f"Available: paper_search, pubmed_search, paper_details, "
+        f"paper_citations, read_paper, scholar_search. "
         f"For web search use browser.search; to open a page use browser.open."
     )
 

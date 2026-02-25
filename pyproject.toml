@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+papers = [
+    "agent-papers-cli",
+]
 client = [
     "openai>=1.0.0",
 ]
