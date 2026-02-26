@@ -280,14 +280,22 @@ async def run_eval(args):
     think_str = " (no-think)" if not enable_thinking else ""
     print(f"Format: {type(adapter).__name__}{think_str}")
 
-    # Wait for workers
+    # Wait for server readiness
     base_url = args.scheduler_url.rstrip("/")
     async with httpx.AsyncClient() as tmp:
         for _ in range(120):
             try:
+                # Try scheduler endpoint first, fall back to vLLM /v1/models
                 r = await tmp.get(f"{base_url}/cluster_status", timeout=5)
-                if r.json().get("ready_workers", 0) > 0:
+                if r.status_code == 200 and r.json().get("ready_workers", 0) > 0:
                     print(f"Cluster: {r.json()['ready_workers']} workers ready")
+                    break
+            except Exception:
+                pass
+            try:
+                r = await tmp.get(f"{base_url}/v1/models", timeout=5)
+                if r.status_code == 200:
+                    print(f"Direct vLLM server ready")
                     break
             except Exception:
                 pass
