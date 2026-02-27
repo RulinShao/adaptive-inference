@@ -66,7 +66,7 @@ Respond with a JSON object:
 
 
 async def generate_trajectory(
-    question, qid, base_url, model, tokenizer,
+    question, qid, base_urls, model, tokenizer,
     adapter: ToolAdapter = None,
     traj_idx=0, max_tool_calls=MAX_TOOL_CALLS,
     max_gen_tokens=MAX_GEN_TOKENS, temperature=TEMPERATURE,
@@ -85,6 +85,16 @@ async def generate_trajectory(
     tool_call_count = 0
     tool_calls_log = []
     conversation = [] if save_conversation else None
+
+    # Round-robin across backend URLs using a global counter
+    if isinstance(base_urls, list):
+        if not hasattr(generate_trajectory, '_rr_counter'):
+            generate_trajectory._rr_counter = 0
+        idx = generate_trajectory._rr_counter % len(base_urls)
+        generate_trajectory._rr_counter += 1
+        base_url = base_urls[idx]
+    else:
+        base_url = base_urls
 
     prompt = adapter.build_prompt(tokenizer, user_message=question, enable_python=enable_python)
     tag = f"qid={qid} t={traj_idx}"
@@ -280,8 +290,10 @@ async def run_eval(args):
     think_str = " (no-think)" if not enable_thinking else ""
     print(f"Format: {type(adapter).__name__}{think_str}")
 
-    # Wait for server readiness
-    base_url = args.scheduler_url.rstrip("/")
+    # Parse URLs (comma-separated for multi-node)
+    raw_urls = [u.strip().rstrip("/") for u in args.scheduler_url.split(",")]
+    base_urls = raw_urls if len(raw_urls) > 1 else raw_urls[0]
+    base_url = raw_urls[0]  # use first for health checks
     async with httpx.AsyncClient() as tmp:
         for _ in range(120):
             try:
@@ -339,7 +351,7 @@ async def run_eval(args):
                 return completed[(qid, traj_idx)]
             try:
                 result = await generate_trajectory(
-                    question=row[q_col], qid=qid, base_url=base_url,
+                    question=row[q_col], qid=qid, base_urls=base_urls,
                     model=args.model, tokenizer=tokenizer, adapter=adapter,
                     traj_idx=traj_idx,
                     max_tool_calls=args.max_tool_calls, temperature=args.temperature,
