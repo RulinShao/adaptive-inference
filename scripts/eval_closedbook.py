@@ -297,6 +297,30 @@ async def run_eval(args):
         print("ERROR: No workers became ready after 60 min. Exiting.", flush=True)
         sys.exit(1)
 
+    # Smoke test: send a tiny completions request to verify end-to-end serving works
+    print("Running smoke test (tiny completion request)...", flush=True)
+    smoke_ok = False
+    async with httpx.AsyncClient(timeout=120) as tmp:
+        for attempt in range(30):
+            try:
+                r = await tmp.post(
+                    f"{base_url}/v1/completions",
+                    json={"model": args.model, "prompt": "Hello", "max_tokens": 1},
+                    headers={"Authorization": "Bearer EMPTY"},
+                )
+                if r.status_code == 200:
+                    print(f"Smoke test passed (status {r.status_code})", flush=True)
+                    smoke_ok = True
+                    break
+                else:
+                    print(f"  smoke test got status {r.status_code}, retrying...", flush=True)
+            except Exception as e:
+                print(f"  smoke test error: {e}, retrying...", flush=True)
+            await asyncio.sleep(10)
+    if not smoke_ok:
+        print("ERROR: Smoke test failed — server cannot serve completions. Exiting.", flush=True)
+        sys.exit(1)
+
     os.makedirs(args.output_dir, exist_ok=True)
     traj_file = os.path.join(args.output_dir, "trajectories.jsonl")
     results_file = os.path.join(args.output_dir, "results.json")
