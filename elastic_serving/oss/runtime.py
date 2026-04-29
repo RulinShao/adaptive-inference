@@ -28,6 +28,12 @@ Do not quote more than 10 words directly from the tool output.
 sources=web
 """.strip()
 
+ALLOWED_BROWSER_RECIPIENTS = {
+    "browser.search",
+    "browser.open",
+    "browser.find",
+}
+
 
 class BrowserPool:
     def __init__(self, blocked_substrings: Sequence[str] | None = None):
@@ -71,6 +77,23 @@ class BrowserPool:
             del self.sessions[qid]
 
 
+def _validate_generated_messages(messages: List[Message]) -> Optional[str]:
+    """Reject model samples that parse as non-assistant messages or bad tools."""
+    if not messages:
+        return "no messages parsed"
+
+    for msg in messages:
+        role = msg.author.role
+        if role != Role.ASSISTANT:
+            return f"generated non-assistant message: {msg.to_dict()}"
+
+        recipient = getattr(msg, "recipient", None)
+        if recipient is not None and str(recipient) not in ALLOWED_BROWSER_RECIPIENTS:
+            return f"generated invalid tool recipient {recipient!r}: {msg.to_dict()}"
+
+    return None
+
+
 async def _generate_with_retry(
     generator,
     tokens: List[int],
@@ -99,6 +122,15 @@ async def _generate_with_retry(
             if parse_error is not None:
                 last_exception = parse_error
                 print(f"\n--- Generation failed on attempt {attempt}/{max_retries} (parse error) ---")
+                continue
+
+            validation_error = _validate_generated_messages(parser.messages)
+            if validation_error is not None:
+                last_exception = ValueError(validation_error)
+                print(
+                    f"\n--- Generation failed on attempt {attempt}/{max_retries} "
+                    f"(invalid Harmony action: {validation_error}) ---"
+                )
                 continue
 
             return parser.messages
