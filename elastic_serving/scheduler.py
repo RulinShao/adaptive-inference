@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import itertools
 import json as _json
 import logging
@@ -47,6 +48,18 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("scheduler")
+
+
+_ROUTING_WORKER_HEADER = "x-elastic-worker-id"
+_ROUTING_ENDPOINT_HEADER = "x-elastic-endpoint"
+_ROUTING_AFFINITY_HEADER = "x-elastic-affinity-key"
+
+
+def _normalize_worker_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip().rstrip("/")
+    if endpoint.endswith("/v1"):
+        endpoint = endpoint[:-3]
+    return endpoint.rstrip("/")
 
 
 # =============================================================================
@@ -239,9 +252,46 @@ class AdaptiveScheduler:
         ]
         self._rr_cycle = itertools.cycle(self._rr_workers) if self._rr_workers else itertools.cycle([])
 
-    def pick_worker(self) -> Optional[WorkerInfo]:
-        """Pick next READY worker via round-robin."""
+    def pick_worker(
+        self,
+        *,
+        worker_id: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        affinity_key: Optional[str] = None,
+    ) -> Optional[WorkerInfo]:
+        """Pick a READY worker.
+
+        Selection order:
+        1. explicit worker id
+        2. explicit worker base endpoint
+        3. stable affinity key hash
+        4. round-robin fallback
+        """
         with self.lock:
+            ready = [
+                w for w in self.workers.values()
+                if w.status == WorkerStatus.READY
+            ]
+            if not ready:
+                return None
+
+            if worker_id:
+                w = self.workers.get(worker_id)
+                return w if w and w.status == WorkerStatus.READY else None
+
+            if endpoint:
+                normalized = _normalize_worker_endpoint(endpoint)
+                for w in ready:
+                    if _normalize_worker_endpoint(w.base_url) == normalized:
+                        return w
+                return None
+
+            if affinity_key:
+                ordered = sorted(ready, key=lambda w: w.worker_id)
+                digest = hashlib.sha256(affinity_key.encode("utf-8")).digest()
+                idx = int.from_bytes(digest[:8], "big") % len(ordered)
+                return ordered[idx]
+
             if not self._rr_workers:
                 return None
             for _ in range(len(self._rr_workers)):
@@ -686,17 +736,34 @@ async def _proxy_post(
     http_client: httpx.AsyncClient,
 ):
     """Proxy a POST request to a ready worker with streaming support."""
-    worker = scheduler.pick_worker()
+    routing_worker_id = request.headers.get(_ROUTING_WORKER_HEADER)
+    routing_endpoint = request.headers.get(_ROUTING_ENDPOINT_HEADER)
+    routing_affinity = request.headers.get(_ROUTING_AFFINITY_HEADER)
+    worker = scheduler.pick_worker(
+        worker_id=routing_worker_id,
+        endpoint=routing_endpoint,
+        affinity_key=routing_affinity,
+    )
     if not worker:
+        detail = "No ready workers available. Workers may still be starting."
+        if routing_worker_id or routing_endpoint or routing_affinity:
+            detail = (
+                "No ready worker matched routing hints "
+                f"worker_id={routing_worker_id!r} endpoint={routing_endpoint!r} "
+                f"affinity_key={routing_affinity!r}."
+            )
         raise HTTPException(
             status_code=503,
-            detail="No ready workers available. Workers may still be starting.",
+            detail=detail,
         )
 
     body = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
+    headers.pop(_ROUTING_WORKER_HEADER, None)
+    headers.pop(_ROUTING_ENDPOINT_HEADER, None)
+    headers.pop(_ROUTING_AFFINITY_HEADER, None)
 
     target_url = f"{worker.base_url}{path}"
 
@@ -721,7 +788,11 @@ async def _proxy_post(
         return StreamingResponse(
             stream_generator(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"},
+            headers={
+                "Cache-Control": "no-cache",
+                "x-elastic-selected-worker-id": worker.worker_id,
+                "x-elastic-selected-endpoint": worker.base_url,
+            },
         )
     else:
         try:
@@ -730,6 +801,10 @@ async def _proxy_post(
                 content=resp.content,
                 status_code=resp.status_code,
                 media_type=resp.headers.get("content-type", "application/json"),
+                headers={
+                    "x-elastic-selected-worker-id": worker.worker_id,
+                    "x-elastic-selected-endpoint": worker.base_url,
+                },
             )
         except httpx.ConnectError:
             logger.warning(f"Connection failed to {worker.worker_id}, marking offline")
@@ -748,6 +823,10 @@ async def _proxy_post(
                 content=resp.content,
                 status_code=resp.status_code,
                 media_type=resp.headers.get("content-type", "application/json"),
+                headers={
+                    "x-elastic-selected-worker-id": worker2.worker_id,
+                    "x-elastic-selected-endpoint": worker2.base_url,
+                },
             )
 
 
