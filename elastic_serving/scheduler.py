@@ -105,6 +105,8 @@ class ClusterStatusResponse(BaseModel):
     model: str
     engine: str
     max_nodes: int
+    max_model_len: Optional[int] = None
+    default_temperature: Optional[float] = None
     tensor_parallel_size: int
     dp_per_node: int
     total_nodes_active: int
@@ -596,6 +598,8 @@ class AdaptiveScheduler:
                 model=self.config.model,
                 engine=self.config.engine,
                 max_nodes=self.config.max_nodes,
+                max_model_len=self.config.max_model_len,
+                default_temperature=self.config.default_temperature,
                 tensor_parallel_size=self.config.tensor_parallel_size,
                 dp_per_node=self.config.dp_per_node,
                 total_nodes_active=active_nodes,
@@ -916,6 +920,8 @@ Examples:
                         help="TP size per instance. DP = gpus_per_node / TP.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
     parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument("--default-temperature", type=float, default=None,
+                        help="Informational default client temperature shown in status")
     parser.add_argument("--served-model-name", type=str, default=None)
     parser.add_argument("--engine-extra-args", type=str, default=None,
                         help="Extra arguments passed to vLLM/SGLang server")
@@ -964,6 +970,7 @@ Examples:
         "tensor_parallel_size": args.tensor_parallel_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "max_model_len": args.max_model_len,
+        "default_temperature": args.default_temperature,
         "served_model_name": args.served_model_name,
         "engine_extra_args": args.engine_extra_args,
         "enable_prefix_caching": False if args.no_prefix_caching else None,

@@ -100,6 +100,7 @@ class SchedulerConfig:
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.90
     max_model_len: Optional[int] = None
+    default_temperature: Optional[float] = None
     served_model_name: Optional[str] = None
     engine_extra_args: str = ""            # extra args for vllm/sglang
     enable_prefix_caching: bool = True     # disable for Mamba/hybrid architectures
