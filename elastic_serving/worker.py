@@ -340,9 +340,17 @@ class WorkerDaemon:
     def _heartbeat_loop(self):
         while self.running:
             for inst in self.instances:
-                if inst.status == "READY":
-                    alive = inst.process and inst.process.poll() is None
-                    status = WorkerStatus.READY.value if alive else WorkerStatus.OFFLINE.value
+                if inst.status in {"LOADING", "READY"}:
+                    if inst.process is None:
+                        status = WorkerStatus.LOADING.value
+                    else:
+                        alive = inst.process.poll() is None
+                        if not alive:
+                            status = WorkerStatus.OFFLINE.value
+                        elif inst.status == "READY":
+                            status = WorkerStatus.READY.value
+                        else:
+                            status = WorkerStatus.LOADING.value
                     self._send_heartbeat(inst, status)
             time.sleep(self.heartbeat_interval)
 
@@ -379,6 +387,13 @@ class WorkerDaemon:
             else:
                 logger.error(f"Failed to register {inst.worker_id} after 10 attempts.")
                 # Continue with other instances
+
+        # Keep registered-but-not-yet-started DP instances alive in the
+        # scheduler while sequential model loading happens.
+        heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name="heartbeat"
+        )
+        heartbeat_thread.start()
 
         # Start server instances with staggered startup to avoid race
         # conditions (e.g. both vLLM instances loading Harmony encoding
@@ -425,12 +440,6 @@ class WorkerDaemon:
             sys.exit(1)
 
         logger.info(f"{ready_count}/{self.dp_size} DP instances READY")
-
-        # Start heartbeat thread
-        heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, daemon=True, name="heartbeat"
-        )
-        heartbeat_thread.start()
 
         # Wait for any server process to exit
         try:
