@@ -307,6 +307,13 @@ class AdaptiveScheduler:
         with self.lock:
             return [w for w in self.workers.values() if w.status == WorkerStatus.READY]
 
+    def record_request(self, worker_id: str) -> None:
+        """Increment scheduler-side request counter for proxied requests."""
+        with self.lock:
+            w = self.workers.get(worker_id)
+            if w:
+                w.requests_served += 1
+
     # ---- Health checking ----
 
     def check_worker_health(self):
@@ -782,14 +789,20 @@ async def _proxy_post(
 
     if is_stream:
         async def stream_generator():
+            counted = False
             try:
                 async with http_client.stream(
                     "POST", target_url, content=body, headers=headers
                 ) as resp:
+                    if resp.status_code < 500:
+                        scheduler.record_request(worker.worker_id)
+                        counted = True
                     async for chunk in resp.aiter_bytes():
                         yield chunk
             except Exception as e:
                 logger.error(f"Streaming error from {worker.worker_id}: {e}")
+                if not counted:
+                    scheduler.record_request(worker.worker_id)
                 yield f"data: {_json.dumps({'error': str(e)})}\n\n".encode()
 
         return StreamingResponse(
@@ -804,6 +817,8 @@ async def _proxy_post(
     else:
         try:
             resp = await http_client.post(target_url, content=body, headers=headers)
+            if resp.status_code < 500:
+                scheduler.record_request(worker.worker_id)
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -826,6 +841,8 @@ async def _proxy_post(
                 raise HTTPException(status_code=503, detail="No ready workers available")
             target_url2 = f"{worker2.base_url}{path}"
             resp = await http_client.post(target_url2, content=body, headers=headers)
+            if resp.status_code < 500:
+                scheduler.record_request(worker2.worker_id)
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
