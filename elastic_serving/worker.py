@@ -228,7 +228,7 @@ class WorkerDaemon:
                 "--tensor-parallel-size", str(self.tensor_parallel_size),
                 "--gpu-memory-utilization", str(self.gpu_memory_utilization),
                 "--trust-remote-code",
-                "--disable-log-requests",
+                "--no-enable-log-requests",
             ]
             if self.enable_prefix_caching:
                 cmd.append("--enable-prefix-caching")
