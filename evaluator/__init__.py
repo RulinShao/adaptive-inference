@@ -29,6 +29,22 @@ from .frontierscience_evaluator import (
     FrontierScienceEvaluator,
     FrontierScienceInstance,
 )
+from .healthbench_professional_evaluator import (
+    HealthBenchProfessionalEvalResult,
+    HealthBenchProfessionalEvalSummary,
+    HealthBenchProfessionalEvaluator,
+    HealthBenchProfessionalInstance,
+    HealthBenchProfessionalJudgeResult,
+    HealthBenchProfessionalRubricGrade,
+    HealthBenchProfessionalRubricItem,
+)
+from .hle_evaluator import (
+    HLEEvalResult,
+    HLEEvalSummary,
+    HLEEvaluator,
+    HLEInstance,
+    HLEJudgeResult,
+)
 
 EvaluatorClass = type[Evaluator[Any, Any, Any]]
 
@@ -50,6 +66,8 @@ EVALUATORS: dict[str, EvaluatorClass] = {
     "deepsearchqa": DeepSearchQAEvaluator,
     "finsearchcomp": FinSearchCompEvaluator,
     "frontierscience": FrontierScienceEvaluator,
+    "healthbench-professional": HealthBenchProfessionalEvaluator,
+    "hle": HLEEvaluator,
 }
 
 
@@ -102,4 +120,16 @@ __all__ = [
     "FrontierScienceEvalSummary",
     "FrontierScienceEvaluator",
     "FrontierScienceInstance",
+    "HealthBenchProfessionalEvalResult",
+    "HealthBenchProfessionalEvalSummary",
+    "HealthBenchProfessionalEvaluator",
+    "HealthBenchProfessionalInstance",
+    "HealthBenchProfessionalJudgeResult",
+    "HealthBenchProfessionalRubricGrade",
+    "HealthBenchProfessionalRubricItem",
+    "HLEEvalResult",
+    "HLEEvalSummary",
+    "HLEEvaluator",
+    "HLEInstance",
+    "HLEJudgeResult",
 ]

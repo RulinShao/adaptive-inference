@@ -8,7 +8,7 @@ from typing import Any
 import openai
 from dotenv import load_dotenv
 
-from .base import Evaluator
+from .base import Evaluator, strip_think_blocks
 
 load_dotenv()
 
@@ -187,6 +187,7 @@ class BrowseCompEvaluator(
         self.judge_metadata = {
             "model": self.model,
             "max_output_tokens": self.max_output_tokens,
+            "strip_think_blocks": True,
         }
 
     @classmethod
@@ -232,6 +233,7 @@ class BrowseCompEvaluator(
         instance: BrowseCompInstance,
         response: str,
     ) -> BrowseCompEvalResult:
+        response = strip_think_blocks(response)
         if not response or not instance.is_completed:
             return BrowseCompEvalResult(
                 id=instance.id,

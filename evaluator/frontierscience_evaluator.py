@@ -8,7 +8,7 @@ from typing import Any, Optional
 import openai
 from dotenv import load_dotenv
 
-from .base import Evaluator
+from .base import Evaluator, strip_think_blocks
 
 load_dotenv()
 
@@ -266,6 +266,7 @@ class FrontierScienceEvaluator(
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "max_output_tokens": self.max_output_tokens,
+            "strip_think_blocks": True,
         }
 
     @classmethod
@@ -325,6 +326,7 @@ class FrontierScienceEvaluator(
         instance: FrontierScienceInstance,
         response: str,
     ) -> FrontierScienceEvalResult:
+        response = strip_think_blocks(response)
         extracted_answer = (
             extract_olympiad_attempted_answer(response)
             if self.split == "olympiad"
