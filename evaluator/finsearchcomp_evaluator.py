@@ -9,7 +9,7 @@ from typing import Any
 import openai
 from dotenv import load_dotenv
 
-from .base import Evaluator
+from .base import Evaluator, strip_think_blocks
 
 load_dotenv()
 
@@ -188,6 +188,7 @@ class FinSearchCompEvaluator(
             "model": self.model,
             "max_output_tokens": self.max_output_tokens,
             "reasoning_effort": self.reasoning_effort,
+            "strip_think_blocks": True,
         }
 
     @classmethod
@@ -242,6 +243,7 @@ class FinSearchCompEvaluator(
         instance: FinSearchCompInstance,
         response: str,
     ) -> FinSearchCompEvalResult:
+        response = strip_think_blocks(response)
         task_type = "T2" if instance.id.startswith("(T2)") else "T3"
         if not instance.is_completed or not response:
             error = (

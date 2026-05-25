@@ -11,7 +11,7 @@ from typing import Any, Optional, Protocol
 
 from dotenv import load_dotenv
 
-from .base import Evaluator
+from .base import Evaluator, strip_think_blocks
 
 load_dotenv()
 
@@ -557,6 +557,7 @@ class DeepSearchQAEvaluator(
             "judge_provider": judge_provider,
             "max_output_tokens": max_output_tokens,
             "llm_max_retries": llm_max_retries,
+            "strip_think_blocks": True,
         }
         self.judge_provider = injected_judge_provider or create_judge_provider(
             provider_name=judge_provider,
@@ -624,6 +625,7 @@ class DeepSearchQAEvaluator(
         instance: DeepSearchQAInstance,
         response: str,
     ) -> DeepSearchQAEvalResult:
+        response = strip_think_blocks(response)
         item_rating = ItemRating(
             example_id=instance.id,
             query=instance.question,

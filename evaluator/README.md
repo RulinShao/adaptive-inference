@@ -57,12 +57,16 @@ Ultimately, the goal of the evaluators is to provide abstraction so that the man
 | `deepsearchqa` | `DeepSearchQAEvaluator` | `rl-rag-2/deepsearchqa` | `id`, `question`, `answer`, `answer_type`, `is_completed` |
 | `finsearchcomp` | `FinSearchCompEvaluator` | `rl-rag-2/finsearchcomp` | `id`, `question`, `response_reference`, `judge_prompt_template`, `judge_system_prompt`, `is_completed` |
 | `frontierscience` | `FrontierScienceEvaluator` | `rl-rag-2/frontierscience` | `id`, `question`, `answer`, `is_completed` |
+| `healthbench-professional` | `HealthBenchProfessionalEvaluator` | `openai/healthbench-professional` | `id`, `row_index`, `question`, `conversation_messages`, `gold`, `rubric_items`, `is_completed` |
+| `hle` | `HLEEvaluator` | `rl-rag-2/hle_text_only_curated_600_samples` | `id`, `row_index`, `question`, `answer`, `image`, `is_completed` |
 
 `frontierscience` requires `--split {olympiad,research}` and loads that split from the same Hugging Face dataset.
 
 ## Dataset Caveats
 
 For all datasets, we assume that model outputs that were incomplete due to context length (marked as `is_completed=False`) are incorrect, and do not call the judge for them.
+
+All evaluators strip exposed `<think>...</think>` blocks from model responses before judging, because local reasoning-model outputs may include hidden reasoning traces that should not be graded as answer content.
 
 ### BrowseComp
 
@@ -84,3 +88,16 @@ We do not compute calibration error for now, as it may not be necessary at this 
 
 - The research subset has 1 duplicate question. This has been removed, so we eval on 59/60 questions.
 - Be mindful whether the results reported used search or not.
+
+### HealthBench Professional
+
+- The evaluator loads the official raw JSONL from `openai/healthbench-professional` by default. Use `--reference-source` to pass either a local HealthBench Professional JSONL or a simple-evals HealthBench-format JSONL.
+- It follows the `openai/simple-evals` HealthBench reference path after response preprocessing: the full HealthBench grader prompt, independent rubric-item grading, negative-point rubric handling, `achieved_points / total_positive_points`, example-tag metrics, rubric-tag metrics, clipped aggregate means, `n_samples`, and bootstrap standard deviations.
+- The default grader settings match the simple-evals HealthBench Professional option bundle: `gpt-5.4-2026-03-05`, low reasoning effort, no max output token cap for the reasoning grader, length-adjustment center `2000`, and penalty `0.0147` per 500 response characters.
+- Instances are keyed by both official `id` and zero-based `row_index` when possible, so run outputs may use either value as `query_id`.
+
+### HLE
+
+- The evaluator follows `gpt-baselines/hle/run_judge_results.py`: it asks a judge to extract the final answer, compare it against the official answer, extract confidence, and returns accuracy plus calibration error.
+- The default source is the curated 600-row text-only dataset at `rl-rag-2/hle_text_only_curated_600_samples`. If Hugging Face access requires authentication in the runtime, pass a local JSONL path to `--dataset`, for example `../gpt-baselines/hle/outputs/hle_text_only_curated_600_samples.jsonl`.
+- Use `--text-only` to skip rows whose `image` field is non-empty.
